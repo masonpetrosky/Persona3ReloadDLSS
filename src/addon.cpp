@@ -336,9 +336,13 @@ bool ReadTaaConstants(device* dev, const p3rdlss::Descriptors& descriptors, cons
   uint32_t globals = UINT32_MAX, view = UINT32_MAX;
   const std::vector<p3rdlss::Descriptors::ParamInfo> params = descriptors.Params(layout);
   for (uint32_t i = 0; i < params.size(); ++i) {
+    // A root CBV: push_descriptors in root signature 1.0, push_descriptors_with_ranges_and_flags in 1.1 (Unreal's).
     const p3rdlss::Descriptors::ParamInfo& p = params[i];
-    if (p.type != pipeline_layout_param_type::push_descriptors || p.ranges.empty() ||
-        p.ranges[0].type != descriptor_type::constant_buffer || p.ranges[0].dx_register_space != 0)
+    if ((p.type != pipeline_layout_param_type::push_descriptors &&
+         p.type != pipeline_layout_param_type::push_descriptors_with_ranges &&
+         p.type != pipeline_layout_param_type::push_descriptors_with_ranges_and_flags) ||
+        p.ranges.size() != 1 || p.ranges[0].type != descriptor_type::constant_buffer ||
+        p.ranges[0].dx_register_space != 0)
       continue;
     if (p.ranges[0].dx_register_index == kGlobalsCbv) globals = i;
     if (p.ranges[0].dx_register_index == kViewCbv) view = i;
@@ -349,7 +353,11 @@ bool ReadTaaConstants(device* dev, const p3rdlss::Descriptors& descriptors, cons
   }
   if (data.cbv_layout != layout || globals >= data.cbvs.size() || view >= data.cbvs.size() ||
       data.cbvs[globals].buffer == 0 || data.cbvs[view].buffer == 0) {
-    *why = "its constant buffers were not seen";
+    size_t seen = 0;
+    for (const buffer_range& range : data.cbvs) seen += range.buffer != 0;
+    *why = "its constant buffers b0 and b1 (root parameters " + std::to_string(globals) + " and " +
+           std::to_string(view) + ") were not seen; " + std::to_string(seen) + " root constant buffer(s) set" +
+           (data.cbv_layout == layout ? "" : " for another root signature");
     return false;
   }
   int32_t camera_cut = 0;

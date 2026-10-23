@@ -134,10 +134,13 @@ void Descriptors::OnInitPipelineLayout(device* device, uint32_t count, const pip
     copy[i].type = params[i].type;
     switch (params[i].type) {
       case pipeline_layout_param_type::descriptor_table:
+      case pipeline_layout_param_type::push_descriptors_with_ranges:
         copy[i].ranges.assign(params[i].descriptor_table.ranges,
                               params[i].descriptor_table.ranges + params[i].descriptor_table.count);
         break;
+      // Root signature 1.1: tables, and root descriptors (ReShade reports those as one range with flags).
       case pipeline_layout_param_type::descriptor_table_with_flags:
+      case pipeline_layout_param_type::push_descriptors_with_ranges_and_flags:
         for (uint32_t r = 0; r < params[i].descriptor_table_with_flags.count; ++r)
           copy[i].ranges.push_back(params[i].descriptor_table_with_flags.ranges[r]);  // slices off the flags
         break;
