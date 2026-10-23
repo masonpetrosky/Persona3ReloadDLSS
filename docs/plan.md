@@ -54,7 +54,8 @@ Expected obstacles:
    jitter sequence over consecutive frames; which other passes read the TAA's outputs.
 2. **DLAA.** DLSS at native resolution replaces the main TAA pass; the motion vector pass; the jitter override;
    camera cuts; pre-exposure; ReShade overlay settings and an ini; a toggle key. Exit: the user plays with it and
-   prefers it to the game's TAA.
+   prefers it to the game's TAA. Status 2026-10-22: built (`src/addon.cpp`, `src/motion_vectors.hlsl`; installs with
+   `tools\deploy.ps1`), not tested in game yet.
 3. **Upscaling.** `r.ScreenPercentage` with the engine's own temporal upsampling path, replaced by DLSS at that
    dispatch; check the texture mip bias; render scale in the overlay. Exit: in-game test at 50-67%.
 4. **Release.** README, GitHub, Nexus (each confirmed with the user).
