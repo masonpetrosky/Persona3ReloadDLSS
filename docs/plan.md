@@ -55,7 +55,11 @@ Expected obstacles:
 2. **DLAA.** DLSS at native resolution replaces the main TAA pass; the motion vector pass; the jitter override;
    camera cuts; pre-exposure; ReShade overlay settings and an ini; a toggle key. Exit: the user plays with it and
    prefers it to the game's TAA. Status 2026-10-22: built (`src/addon.cpp`, `src/motion_vectors.hlsl`; installs with
-   `tools\deploy.ps1`), not tested in game yet.
+   `tools\deploy.ps1`) and running in game since ec95957 (DLAA at 3840x2160, F9 A/B). The user: better on thin hair,
+   on a near pole and on a back wall (the TAA's horizontal lines are gone); moving ceiling fan blades look "a little
+   wavy". Next: check in the captures whether the fan writes velocity and has the responsive AA stencil bit
+   (`tools/rdc_taa_inputs.py`, `tools/taa_inputs_region.py`), then feed that bit to DLSS as its bias-current-color
+   mask, or set `r.VertexDeformationOutputsVelocity` (the exe has it) so shader-animated meshes write velocity.
 3. **Upscaling.** `r.ScreenPercentage` with the engine's own temporal upsampling path, replaced by DLSS at that
    dispatch; check the texture mip bias; render scale in the overlay. Exit: in-game test at 50-67%.
 4. **Release.** README, GitHub, Nexus (each confirmed with the user).
