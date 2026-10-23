@@ -47,6 +47,89 @@
 - Stuttering Fix DX12 Async Compile (Nexus 82, a `d3d12.dll` proxy): confirms the game is D3D12 and that it
   "bypasses the usual private command-list vtable routes during active rendering".
 
-## Captures
+## Captures (2026-10-22)
 
-None yet. Plan: a field scene with walking characters (3 consecutive frames, camera moving), later a battle.
+`captures/p3r_frame10211.rdc`, `10212` and `10213` (git-ignored, 1.2 GB each): three consecutive frames in the dorm
+lounge ("4/17 Fri Evening"), the protagonist walking, the camera still. Taken with `tools/launch_rdc.bat` (ReShade,
+RenoDX and SCSKiller's recorder switched off for the session) and `tools/rdc_trigger.py`. Analysis scripts:
+`rdc_quick.py` (overview), `rdc_survey.py` (every action with its bindings: `captures/survey_10211`),
+`rdc_inspect.py` (full state, constant buffers and disassembly of chosen events: `captures/inspect_10211`) and
+`rdc_taa.py` (the TAA dispatches of several captures side by side: `captures/taa_frames.txt`).
+
+### Frame layout (10211)
+
+3198 actions (2809 draws, 145 dispatches, one present), no debug markers. The scene is rendered twice:
+
+1. Events 1107-13843: a **planar reflection** view, 2880x1620 (75%) in the 3840x2160 scene textures: its own
+   shadows, G-buffer, velocity, lights and TAA (13829), copied (13843) into a 2880x1620 target that the main view
+   composites into its reflections at 21135 (after the screen space reflections at 21125).
+2. Events 13847-21585: the **main view** at 3840x2160: shadows, G-buffer (258 draws), velocity (91 draws into
+   `tex29598`), lights, translucency, separate translucency composite (21563), a post-process material (21578, a
+   UE "before tonemapping" material, which 4.27 runs before TAA) and the **main TAA at 21585**.
+3. After the TAA: a half-size copy for bloom (21597, 1920x1080 R11G11B10), the eye adaptation readback (21599
+   copies the 1x1 eye adaptation texture into a 16-byte buffer), eye adaptation (21674), bloom, the tonemapper
+   (21908, which reads the TAA output, the bloom and a 32x32x32 LUT), the back buffer (21923), the UI at 1920x1080,
+   present.
+
+### The TAA dispatch
+
+Compute shader `TAAStandalone.usf` `MainCS`, DXIL hash `203152694ac6f5d3b98e5464598f5669` (SM 6.0, 8x8 threads,
+wave intrinsics). Both views use this permutation; the dispatch is 480x270 groups for the main view. Root
+signature (UE's compute root signature): `[0]` SRV table t0-t63, `[1]` sampler table s0-s15, `[2]` UAV table u0-u15,
+`[3]` root CBV b0 (`$Globals`, 412 bytes), `[4]` root CBV b1 (`View`, 5220 bytes). Resource names are stripped from
+the DXIL, but the constant buffer layouts are kept, and they match UE 4.27.
+
+| Slot | Main view (21585) | Planar reflection (13829) | UE parameter |
+| --- | --- | --- | --- |
+| t0 | 1x1 R32G32B32A32_FLOAT, value 1.0 | 1x1 B8G8R8A8 dummy | eye adaptation (rotates over three textures) |
+| t1 | 3840x2160 R16G16B16A16_FLOAT | scene color itself | `InputSceneColor` (linear HDR, max ~4.6 here) |
+| t2 | 3840x2160 D32S8, depth plane | same | `SceneDepthTexture` (reverse Z, near plane 10) |
+| t3 | 3840x2160 R16G16B16A16_UNORM | 1x1 B8G8R8A8 dummy | `GBufferVelocityTexture` |
+| t4 | same D32S8, stencil plane (`uint2`) | same | stencil; the shader tests bit 3 (value 8), responsive AA |
+| t5 | 3840x2160 R16G16B16A16_FLOAT | same | `HistoryBuffer[0]` (the previous frame's output) |
+| u0 | 3840x2160 R16G16B16A16_FLOAT | same | `OutComputeTex[0]`, the new history and the TAA output |
+
+There is no second output (the half-size bloom input is a separate draw), so DLSS can write straight into u0. The
+history textures are pooled: three 3840x2160 RGBA16F textures rotate between the two views' histories and outputs
+from frame to frame, so the add-on must take the bindings at each dispatch. The planar reflection pass is told apart
+by its dummy velocity texture (and by its zero jitter).
+
+`$Globals` (b0, 412 bytes, offsets in bytes): `HistoryPreExposureCorrection` +0 (1.0), `CurrentFrameWeight` +4
+(0.2, the game's table), `bCameraCut` +8 (int), `SampleWeights[9]` +16 (unused here), `PlusWeights[5]` +160 (one per
+16-byte row), `ViewportUVToInputBufferUV` +240, `MaxViewportUVAndSvPositionToViewportUV` +256, `ScreenPosAbsMax`
++272, `ScreenPosToHistoryBufferUV` +288, `InputSceneColorSize` +304, `InputMinPixelCoord`/`InputMaxPixelCoord`
++320/+328, `HistoryBufferSize` +336, `HistoryBufferUVMinMax` +352, `OutputViewportSize` +368, `OutputViewportRect`
++384, `OutputQuantizationError` +400.
+
+`View` (b1, 5220 bytes, UE 4.27's `FViewUniformShaderParameters`, laid out from the DXIL type and confirmed by the
+values): `ViewToClip` +448 (jitter in its third row), `ViewToClipNoAA` +512, `ScreenPositionScaleBias` +1056,
+`ClipToPrevClip` +1952 (without jitter), `TemporalAAJitter` +2016 (xy this frame, zw the previous one, in clip
+units: pixels = x * width / 2 and -y * height / 2), `ViewRectMin` +2064, `ViewSizeAndInvSize` +2080,
+`BufferSizeAndInvSize` +2112, `NumSceneColorMSAASamples` +2160, `PreExposure` +2164 (1.0 here),
+`OneOverPreExposure` +2168 (the TAA multiplies the eye adaptation value by it).
+
+### Values over three frames (`captures/taa_frames.txt`)
+
+- Jitter alternates between (-0.25, -0.25) and (+0.25, +0.25) pixels: `r.TemporalAASamples` is 2 (UE's 2x MSAA
+  pattern). The planar reflection has no jitter.
+- `bCameraCut` 0, `PreExposure` 1, eye adaptation 1.0, `CurrentFrameWeight` 0.2 in all three.
+- `ClipToPrevClip` is the identity within 1e-7 (the camera did not move), so it carries no jitter: it is built from
+  the unjittered matrices.
+
+### Velocity (`tex29598`, R16G16B16A16_UNORM)
+
+The velocity pixel shaders (for example 19366) write UE 4.27's encoding with `VELOCITY_ENCODE_DEPTH`:
+`xy = V * 0.2495 + 32767/65535` with `V = (this frame's screen position - the previous one) - (jitter - previous
+jitter)`, in clip units (y up), so the velocity has no jitter in it; `z` and `w` are the high and low 16 bits of the
+change in device depth. Pixels that no object wrote are 0 (the TAA then uses camera motion from depth and
+`ClipToPrevClip`). So DLSS's motion vectors, in pixels and from this frame to the previous one, are
+`-V.x * width / 2`, `+V.y * height / 2`, with `V` from the velocity buffer where `x > 0` and from depth otherwise.
+
+### Who reads the TAA output
+
+The bloom downsample (21597) and the tonemapper (21908) in the same frame; in the next frame the screen space
+reflections (21125, as the previous frame's color) and the TAA itself (as history). The UI is drawn later at
+1920x1080 and is not part of the TAA input.
+
+Still to capture: a moving camera (to check the motion vectors), a battle, and the `r.TemporalAA.Upsampling=1`
+permutation (stage 3).

@@ -21,15 +21,15 @@ and ambient occlusion, Denuvo. Details and sources in [recon.md](recon.md).
 
 A ReShade add-on (D3D12) that finds the main TAA dispatch of every frame and hands DLSS the same inputs:
 
-| DLSS input | From the TAA dispatch (UE 4.27, to be confirmed in the captures) |
+| DLSS input | From the TAA dispatch (UE 4.27; confirmed in the captures, slots and offsets in [recon.md](recon.md)) |
 | --- | --- |
-| color | `InputSceneColor`: linear HDR, pre-exposed by `View.PreExposure` |
-| depth | `SceneDepthTexture`: reverse Z, so DLSS's inverted-depth flag |
-| motion vectors | our own pass: `GBufferVelocity` where an object wrote it (0,0 = not written), otherwise camera motion from depth and `View.ClipToPrevClip`, the way the TAA does it; in pixels, not dilated |
-| jitter | `TemporalJitterPixels` in the TAA's parameters, or `View.TemporalAAJitter` |
-| reset | the TAA's `bCameraCut` |
-| exposure | the pre-exposure value, plus DLSS auto exposure or the engine's eye adaptation texture |
-| output | the TAA's output texture (the new history, which the post-processing reads) |
+| color | `InputSceneColor` (t1): linear HDR, pre-exposed by `View.PreExposure` (1.0 so far) |
+| depth | `SceneDepthTexture` (t2): reverse Z, so DLSS's inverted-depth flag |
+| motion vectors | our own pass: the velocity buffer (t3) where an object wrote it (0 = not written), otherwise camera motion from depth and `View.ClipToPrevClip`, the way the TAA does it; in pixels, not dilated; neither has jitter in it |
+| jitter | `View.TemporalAAJitter` (the non-upsampling permutation has no `TemporalJitterPixels`) |
+| reset | the TAA's `bCameraCut` (`$Globals` +8) |
+| exposure | the eye adaptation texture (t0, 1.0 so far) and `View.PreExposure` |
+| output | the TAA's output texture (u0: the new history, which the post-processing reads) |
 
 Expected obstacles:
 - **Jitter.** The game's per-area table `DT_FldTemporalAATable` sets `r.TemporalAASamples` (and the current frame
@@ -39,11 +39,12 @@ Expected obstacles:
   FF7RebirthNpcMotion does for FF7 Rebirth. `r.TemporalAA.Upsampling=1` may be useful even at 100%: in stock 4.27 it
   should switch the jitter from a Gaussian-weighted to a uniform Halton sequence, which is what DLSS expects (to
   check in the captures).
-- **Other TAA dispatches.** The same shader file also filters screen space reflections, light shafts and depth of
-  field, and scene captures (menus, Persona previews: the game's OffscreenRendering plugin) may run their own TAA.
-  Only the main view's pass is replaced: matched by shader hash, then by its bindings and output size.
-- **Extra outputs.** If the main pass also writes a half-size copy for later passes, the add-on must write it too,
-  or first keep the game's TAA running and overwrite its output (simple, costs the TAA's time).
+- **Other TAA dispatches.** A planar reflection view runs the same TAA permutation each frame (without jitter or
+  velocity), and scene captures (menus, Persona previews: the game's OffscreenRendering plugin) may run their own
+  TAA. Only the main view's pass is replaced: matched by shader hash, then by its velocity binding (a real buffer,
+  not the 1x1 dummy).
+- **Extra outputs.** None: the main pass writes only its history/output texture; the half-size bloom input is a
+  separate draw that reads it.
 - **Denuvo.** No code patches unless there is no other way. Console variables are data.
 
 ## Stages
