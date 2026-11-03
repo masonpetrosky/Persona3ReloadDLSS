@@ -3,8 +3,9 @@
 A ReShade add-on that puts NVIDIA DLSS in place of Persona 3 Reload's TAA: DLAA at native resolution first, then
 upscaling. Free and open source (MIT).
 
-Status: DLAA runs in game since 2026-10-22; upscaling (stage 3, the quality modes) built 2026-11-03, being tested. See [docs/plan.md](docs/plan.md)
-and [docs/recon.md](docs/recon.md).
+Status: DLAA runs in game since 2026-10-22; upscaling (stage 3, the quality modes) since 2026-11-03, every mode
+tried in game; 0.1.0's release zips are built but not published. See [CHANGELOG.md](CHANGELOG.md),
+[docs/plan.md](docs/plan.md) and [docs/recon.md](docs/recon.md).
 
 ## How it works
 
@@ -25,14 +26,19 @@ next to RenoDX's HDR add-on.
 ## Building
 
 `build.ps1`: Visual Studio with the C++ x64 tools (its CMake and Ninja). The first run fetches NVIDIA's DLSS SDK
-into `third_party\dlss` (`tools\fetch_dlss_sdk.ps1`).
+into `third_party\dlss` (`tools\fetch_dlss_sdk.ps1`). `tools\package.ps1` then packs the release zips into `dist\`
+(the version comes from `CMakeLists.txt`): `Persona3ReloadDLSS-<version>.zip` and `Persona3ReloadHudFix-<version>.zip`,
+each laid out like the game's folder, with a README.txt (`package\`) and the licenses.
 
 ## Installing
 
-With the game closed, `tools\deploy.ps1` copies `Persona3ReloadDLSS.addon64`, a default `Persona3ReloadDLSS.ini`
-and `Persona3ReloadDLSS\nvngx_dlss.dll` into the game's `P3R\Binaries\Win64` folder, after copying anything it
-replaces to a backup folder; `-Dev` installs NVIDIA's developer DLL instead (watermark, more logging) and
-`-Uninstall` removes the add-on's files again.
+From a release zip: extract it into the game's folder (Steam: Manage, Browse local files) so that its `P3R` folder
+merges with the game's; the README.txt it puts in `P3R\Binaries\Win64\Persona3ReloadDLSS` has the details.
+
+From the build, with the game closed: `tools\deploy.ps1` copies `Persona3ReloadDLSS.addon64`, the default
+`Persona3ReloadDLSS.ini` (`package\`, only when there is none) and `Persona3ReloadDLSS\nvngx_dlss.dll` into the game's
+`P3R\Binaries\Win64` folder, after copying anything it replaces to a backup folder; `-Dev` installs NVIDIA's developer
+DLL instead (watermark, more logging) and `-Uninstall` removes the add-on's files again.
 
 ## Settings
 

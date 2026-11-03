@@ -85,7 +85,9 @@ Expected obstacles:
    -0.30), the engine built the upsampling permutation as soon as DLSS was available, "DLSS replaces the TAA pass of
    the engine's temporal upsampling", 9,000 frames without a failure, and the logged jitter positions are points of
    the 16-phase uniform Halton sequence (3, 5, 11, 14).
-4. **Release.** README, GitHub, Nexus (each confirmed with the user).
+4. **Release.** README, GitHub, Nexus (each confirmed with the user). 2026-11-03: 0.1.0's zips are built locally
+   (`tools\package.ps1`: DLSS and the HUD fix as two zips laid out like the game's folder, README.txt and licenses
+   inside, versions in the DLLs and the load log line; `CHANGELOG.md`); nothing published, no GitHub repository yet.
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
 

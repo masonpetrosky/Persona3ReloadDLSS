@@ -1543,7 +1543,8 @@ void Initialize(HMODULE module) {
   }
   char text[256];
   std::snprintf(text, sizeof(text),
-                "Loaded. DLSS %s, %s; toggle key %s; %d jitter phases; upsampling path %s, mip bias %.2f; preset %d.",
+                "Loaded version " PROJECT_VERSION_STRING
+                ". DLSS %s, %s; toggle key %s; %d jitter phases; upsampling path %s, mip bias %.2f; preset %d.",
                 g_config.enabled ? "on" : "off", kModes[g_config.mode].name, KeyName(g_config.toggle_key).c_str(),
                 g_config.jitter_phases, g_config.upsampling_path ? "on" : "off", g_config.mip_bias, g_config.preset);
   Log(reshade::log::level::info, text);

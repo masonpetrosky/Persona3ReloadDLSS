@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-add_compile_definitions(UNICODE _UNICODE)
+add_compile_definitions(UNICODE _UNICODE PROJECT_VERSION_STRING="${PROJECT_VERSION}")
 add_compile_options(/W4 /permissive- /utf-8)
 
 # NVIDIA's DLSS SDK is downloaded by tools/fetch_dlss_sdk.ps1 and stays under NVIDIA's license.
@@ -82,6 +82,8 @@ endfunction()
 dxil_shader(kClampAlphaFloorPs hud_fix/clamp_alpha.hlsl ps_6_0 main VALUE=0)
 dxil_shader(kClampAlphaCeilingPs hud_fix/clamp_alpha.hlsl ps_6_0 main VALUE=1)
 
-add_library(Persona3ReloadHudFix SHARED src/hud_fix/addon.cpp ${HUD_SHADER_HEADERS})
+configure_file(src/hud_fix/version.rc.in ${CMAKE_BINARY_DIR}/hud_fix_version.rc @ONLY)
+add_library(Persona3ReloadHudFix SHARED src/hud_fix/addon.cpp ${CMAKE_BINARY_DIR}/hud_fix_version.rc
+            ${HUD_SHADER_HEADERS})
 target_include_directories(Persona3ReloadHudFix PRIVATE third_party/reshade third_party/imgui ${SHADER_DIR})
 set_target_properties(Persona3ReloadHudFix PROPERTIES SUFFIX ".addon64")

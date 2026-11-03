@@ -435,7 +435,8 @@ void Initialize(HMODULE module) {
   GetModuleFileNameW(module, path, MAX_PATH);
   g_ini_path = fs::path(path).parent_path() / L"Persona3ReloadHudFix.ini";
   g_enabled = GetPrivateProfileIntW(L"Persona3ReloadHudFix", L"Enabled", 1, g_ini_path.c_str()) != 0;
-  Log(reshade::log::level::info, std::string("Loaded; clamping ") + (g_enabled ? "on." : "off."));
+  Log(reshade::log::level::info,
+      std::string("Loaded version " PROJECT_VERSION_STRING "; clamping ") + (g_enabled ? "on." : "off."));
 }
 
 }  // namespace

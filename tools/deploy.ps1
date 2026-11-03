@@ -51,28 +51,5 @@ foreach ($file in $build, $source) {
 New-Item -ItemType Directory -Force $data | Out-Null
 Copy-Item $build $addon -Force
 Copy-Item $source $dll -Force
-if (-not (Test-Path $ini)) {
-  @'
-[Persona3ReloadDLSS]
-; 1: DLSS replaces the game's TAA; 0: the game's TAA. ToggleKey switches in game (120 = F9).
-Enabled=1
-; 0 DLAA (100%), 1 Quality (67%), 2 Balanced (58%), 3 Performance (50%), 4 Ultra Performance (33%).
-Mode=0
-ToggleKey=120
-; 0: NVIDIA's default per mode (K; M for Performance, L for Ultra Performance); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M.
-Preset=0
-; The camera jitter's phases while DLSS runs (r.TemporalAASamples); 0 keeps the game's. Ultra Performance: at most 14.
-JitterPhases=16
-; 1: while DLSS runs, the engine's temporal upsampling path (Halton jitter over the whole pixel); 0: the game's path.
-UpsamplingPath=1
-; The texture mip bias on that path; NVIDIA recommends -1.0 for DLAA, toward 0 if fine textures shimmer.
-MipBias=-1.00
-; NVIDIA Reflex low-latency mode (1 on, 0 off).
-Reflex=1
-; 0 keeps the game's frame rate limit; otherwise this cap (a few under the refresh rate with VRR, e.g. 237 at 240 Hz).
-FrameRateCap=0
-; 1: DLSS gets the game's eye adaptation exposure; 0: DLSS estimates one.
-GameExposure=1
-'@ | Set-Content -Path $ini -Encoding ascii
-}
+if (-not (Test-Path $ini)) { Copy-Item (Join-Path $root 'package\Persona3ReloadDLSS.ini') $ini }
 Write-Host "Installed into $Win64 (DLSS DLL: $dlssBuild)."
