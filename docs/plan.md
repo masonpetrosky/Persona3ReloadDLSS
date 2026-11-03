@@ -65,9 +65,9 @@ Expected obstacles:
    samples the pixel's corners), which the engine's temporal upsampling path replaces with uniform Halton: stage 3.
 3. **Upscaling.** `r.ScreenPercentage` with the engine's own temporal upsampling path, replaced by DLSS at that
    dispatch; check the texture mip bias; render scale in the overlay. Exit: in-game test at 50-67%. First step: a
-   capture with `r.TemporalAA.Upsampling 1` at 100% (`[SystemSettings]` in the user's
-   `%LOCALAPPDATA%\P3R\Saved\Config\WindowsNoEditor\Engine.ini` for that session) for the upsampling permutation's
-   bindings and its jitter; DLAA through that path then gets uniform Halton jitter too.
+   capture with `r.TemporalAA.Upsampling 1` at 100% (`tools\launch_rdc_upsampling.bat`: `[SystemSettings]` in the
+   user's `%LOCALAPPDATA%\P3R\Saved\Config\WindowsNoEditor\Engine.ini` for that session only) for the upsampling
+   permutation's bindings and its jitter; DLAA through that path then gets uniform Halton jitter too.
 4. **Release.** README, GitHub, Nexus (each confirmed with the user).
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
