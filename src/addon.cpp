@@ -1283,9 +1283,10 @@ void ApplyEngineVariables() {
   const bool dlss = g_config.enabled && g_dlss_available;
   // The jitter phases. The game's own changes of the variable land in [0] first, so [0] keeps its value; the jitter
   // reads [1]. Below 100% the upsampling path multiplies them by 1 / scale^2, and this game keeps the sample index in
-  // a signed byte: past 128 phases it turns negative, Halton gives 0 and the jitter sits at the pixel's corner
-  // (-0.5, -0.5) for about 127 frames of every 256 (seen at Ultra Performance: 16 x 9 = 144 phases; the image comes
-  // and goes). So the product stays at 127 or less (Ultra Performance 14 x 9 = 126, above NVIDIA's 72).
+  // a signed byte (movsx from the view state, docs/recon.md): above 128 phases it turns negative, Halton gives 0 and
+  // the jitter sits at the pixel's corner (-0.5, -0.5) for 127 frames of every 256 (seen at Ultra Performance:
+  // 16 x 9 = 143 phases after the engine's rounding; the image comes and goes). So the product stays at 127 or less
+  // (Ultra Performance 14 x 9 = 125, above NVIDIA's 72).
   if (int32_t* const samples = g_taa_samples.load()) {
     int32_t want = dlss && g_config.jitter_phases > 0 ? g_config.jitter_phases : samples[0];
     const float render_scale = RenderScale();
@@ -1427,7 +1428,9 @@ void OnOverlay(effect_runtime*) {
   if (ImGui::IsItemDeactivatedAfterEdit()) SaveConfig();
   ImGui::SetItemTooltip("While DLSS runs, the camera jitter cycles through this many sub-pixel positions "
                         "(r.TemporalAASamples). The game uses 2, which leaves DLSS too little to work with; NVIDIA "
-                        "asks for at least 8. 0 keeps the game's.");
+                        "asks for at least 8. 0 keeps the game's.\nBelow 100%% the engine multiplies them by "
+                        "1 / scale^2, and this game's jitter breaks above 128 phases, so Ultra Performance gets at "
+                        "most 14 (x 9).");
   if (ImGui::Checkbox("Halton jitter (the engine's upsampling path)", &g_config.upsampling_path)) SaveConfig();
   ImGui::SetItemTooltip("While DLSS runs, the engine renders through its temporal upsampling path at 100%% "
                         "(r.TemporalAA.Upsampling 1): the camera jitter covers the whole pixel in a Halton sequence, "
@@ -1465,9 +1468,18 @@ void OnOverlay(effect_runtime*) {
     ImGui::TextWrapped("%s", g_taa_info.c_str());
   }
   if (g_nvidia_ready) {
-    if (const int32_t* const samples = g_taa_samples.load())
-      ImGui::Text("Camera jitter: %d phases (the game asks for %d)", samples[1], samples[0]);
-    else
+    if (const int32_t* const samples = g_taa_samples.load()) {
+      // Below 100% the upsampling path multiplies the phases by 1 / scale^2 (in float, truncated), as the engine does.
+      const uint32_t render_width = g_render_width.load(), out_width = g_out_width.load();
+      const int32_t* const upsampling = g_taa_upsampling.load();
+      if (upsampling != nullptr && upsampling[1] != 0 && render_width != 0 && render_width < out_width) {
+        const float fraction = static_cast<float>(render_width) / static_cast<float>(out_width);
+        ImGui::Text("Camera jitter: %d phases, %d at this render scale (the game asks for %d)", samples[1],
+                    static_cast<int>(static_cast<float>(samples[1]) / (fraction * fraction)), samples[0]);
+      } else {
+        ImGui::Text("Camera jitter: %d phases (the game asks for %d)", samples[1], samples[0]);
+      }
+    } else
       ImGui::TextWrapped("Camera jitter: the game's (r.TemporalAASamples not found: %s)", g_jitter_detail.c_str());
     if (const int32_t* const upsampling = g_taa_upsampling.load())
       ImGui::Text("Temporal upsampling path: %s", upsampling[1] != 0 ? "on" : "off");

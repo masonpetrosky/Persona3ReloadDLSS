@@ -76,8 +76,11 @@ Expected obstacles:
    Upscaling, 2026-11-03 (9ef2d0d, installed 18:23 with Mode 1): DLSS replaces the permutation below 100%
    (a82d5ad9), "render 1920x1080 to 2560x1440, output 3840x2160", 9,000 frames without a failure. Paulownia Mall,
    PresentMon (`tools/pm_summary.py`, `captures/perf`): DLAA 88.2 fps (11.34 ms, GPU busy 99%), Quality 142.5 fps
-   (7.02 ms, still GPU-bound): +62%. Balanced, Performance and Ultra Performance not run yet (Ultra Performance may
-   use another permutation).
+   (7.02 ms, still GPU-bound): +62%. The user then ran every mode: all looked good except Ultra Performance, whose
+   image came and went (good for a second, then worse, then good again). Cause ([recon.md](recon.md)): the engine
+   multiplies the jitter phases by 1 / scale^2 (16 x 9 = 143) and keeps the sample index in a signed byte, so above 128
+   phases the jitter sits at the pixel's corner for 127 frames of every 256. Fixed in 217b3cb (at most 127 phases:
+   Ultra Performance 14 x 9 = 125); the overlay shows the engine's count.
    Installed 2026-11-03 17:10 (e5e3cbb); first start 17:27: all three variables found (the engine's mip bias offset
    -0.30), the engine built the upsampling permutation as soon as DLSS was available, "DLSS replaces the TAA pass of
    the engine's temporal upsampling", 9,000 frames without a failure, and the logged jitter positions are points of

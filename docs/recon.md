@@ -204,11 +204,18 @@ add-on's development setting `RenderScale` (3f8b0ed) set `r.ScreenPercentage` 67
   render size (x: -4.858e-5 x 2573 / 2 = -0.0625 px). `MaterialTextureMipBias` +2292 is -1.5777 = log2(0.67005) - 1:
   with `r.ViewTextureMipBias.Offset` at -1 (`MipBias`) the engine applies NVIDIA's formula by itself.
 
-- The jitter's phase count is `r.TemporalAASamples` times 1 / scale^2 on this path, and past 128 the sequence
-  breaks: at Ultra Performance (16 x 9 = 144 phases) 5 of 9 logged frames had a jitter of exactly (-0.5, -0.5), the
-  others Halton points 32, 68 and 104, and the image came and went (good for about half a second, then worse, then
-  good again). That fits a sample index kept in a signed byte: from 128 on it is negative, Halton(n <= 0) is 0, and
-  the jitter sits at the pixel's corner for about 127 frames of every 256. The add-on keeps the product at 127 or less.
+- The jitter's phase count on this path is `r.TemporalAASamples` times 1 / scale^2, and above 128 phases the
+  sequence breaks. At Ultra Performance (16 x 9: 143 phases) 5 of 9 logged frames had a jitter of exactly
+  (-0.5, -0.5), the others Halton points 32, 68 and 104, and the image came and went (the user: good for a second,
+  then worse, then good again). The game's code (P3R.exe build 22672075, the one read of `r.TemporalAASamples`, rva
+  0x28c4901): phases = trunc(samples x max(1, 1 / fraction^2)) in float, clamped to 1..255, with fraction the view
+  rect's width over the output's (1280 / 3840 gives 143, not 144); then `movsx ebx, byte ptr [ViewState+0x572]`,
+  `inc ebx`, `cmp ebx, phases` (0 at or past the end, or on a camera cut) and `mov byte ptr [ViewState+0x572], bl`
+  (0x28c49c5-0x28c49ef). The sample index is a signed byte: with more than 128 phases it passes 127, the stored byte
+  turns negative, both Halton loops skip an index at or below 0 (`test r8d, r8d; jle`, 0x28c4aa4 and 0x28c4ae4), and
+  the jitter sits at the pixel's corner for 127 frames of every 256. The add-on keeps the product at 127 or less
+  (`ApplyEngineVariables`): Ultra Performance gets 14 x 9 = 125 phases, above NVIDIA's 72; the other modes keep 16
+  (Quality 35, Balanced 47, Performance 64).
 
 ### The minimap flash under RenoDX (2026-11-03)
 

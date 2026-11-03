@@ -61,7 +61,7 @@ Mode=0
 ToggleKey=120
 ; 0: NVIDIA's default per mode (K; M for Performance, L for Ultra Performance); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M.
 Preset=0
-; The camera jitter's phases while DLSS runs (r.TemporalAASamples); 0 keeps the game's.
+; The camera jitter's phases while DLSS runs (r.TemporalAASamples); 0 keeps the game's. Ultra Performance: at most 14.
 JitterPhases=16
 ; 1: while DLSS runs, the engine's temporal upsampling path (Halton jitter over the whole pixel); 0: the game's path.
 UpsamplingPath=1
