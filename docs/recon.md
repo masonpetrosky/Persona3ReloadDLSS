@@ -185,4 +185,28 @@ protagonist running and the camera following, taken with `tools\launch_rdc_upsam
   0.043 and more. From 9459 to 9460, the game's long step after RenderDoc saved two frames (569 px): 0.599 against
   1.108 and more (camera), 0.116 against 0.934 and more (velocity). The jitter sign is +1 again.
 
+### The minimap flash under RenoDX (2026-11-03)
+
+RenoDX's known P3R issue: a bright hard-edged shape over the minimap while the HUD slides in after unpausing.
+Captures `p3r_frame38307` to `39218` (ReShade and RenoDX off) at 0.15, 0.30, 0.45, 0.60 and 0.80 s after the button
+that closes the pause menu (`tools/rdc_trigger.py` with `RDC_INPUT_DELAYS`); 0.45 to 0.80 show the slide-in.
+
+- No HUD draw writes colors outside 0..1 near the minimap (`tools/rdc_hud_outputs.py`). The only out-of-range
+  writer there is a full-screen pass onto the back buffer (PS `e1c5ad0f...`, red up to 1.13 at every timing, likely
+  sharpening overshoot on the bright cherry blossoms).
+- The HUD (Slate: VS `1b4c1084...`, PS `083ce4bf...` and `1a12378d...`) draws straight onto the 3840x2160
+  B8G8R8A8_UNORM back buffer and uses its alpha channel as a mask (`tools/rdc_ui_blends.py`). Draws that leave the
+  color alone set alpha (One, Zero), subtract a shape (alpha = dst - src.a^2, ReversedSubtract), add one
+  (dst + src.a^2), intersect (Minimum) or clear it; the content is then blended through the mask (color =
+  src * dstAlpha + dst * (1 - dstAlpha)). The 0.60 s frame has five subtracting draws (the wedges that animate in),
+  the finished 0.80 s frame one.
+- On the 8-bit back buffer every blend result is clamped to 0..1. RenoDX renders the HUD onto a float copy, where
+  the subtraction leaves alpha at -1 and the additions at 1.25 to 2 (`tools/rdc_hud_blends.py` recomputes the
+  blends without the clamp: 35 to 355 of the sampled writes per draw). Content drawn through alpha -1 comes out as
+  src * -1 + dst * 2, a bright shape with the mask's hard edges; additions followed by a subtraction also leave content
+  where the game masks it out.
+- Fix, to build as our own add-on: make the float copy behave like the 8-bit buffer by clamping alpha to 0..1 right
+  after each of these mask draws, drawing the same geometry again with alpha-only Maximum(0) and Minimum(1) blends. It
+  has to match how RenoDX binds its float copy (render target format, pipelines): read in its source first.
+
 Still to capture: a battle.
