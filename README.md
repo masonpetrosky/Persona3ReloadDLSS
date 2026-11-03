@@ -3,8 +3,8 @@
 A ReShade add-on that puts NVIDIA DLSS in place of Persona 3 Reload's TAA: DLAA at native resolution first, then
 upscaling. Free and open source (MIT).
 
-Status: stage 2, DLAA: built, not tested in game yet. See [docs/plan.md](docs/plan.md) and
-[docs/recon.md](docs/recon.md).
+Status: stage 2, DLAA: runs in game since 2026-10-22; upscaling (stage 3) is next. See [docs/plan.md](docs/plan.md)
+and [docs/recon.md](docs/recon.md).
 
 ## How it works
 

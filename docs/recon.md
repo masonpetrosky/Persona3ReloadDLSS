@@ -131,5 +131,35 @@ The bloom downsample (21597) and the tonemapper (21908) in the same frame; in th
 reflections (21125, as the previous frame's color) and the TAA itself (as history). The UI is drawn later at
 1920x1080 and is not part of the TAA input.
 
-Still to capture: a moving camera (to check the motion vectors), a battle, and the `r.TemporalAA.Upsampling=1`
-permutation (stage 3).
+### The ceiling fan and DLSS's inputs (2026-11-03)
+
+With DLAA the user saw the lounge's moving ceiling fan blades "a little wavy". Checked in the three captures with
+`tools/rdc_taa_inputs.py` (raw dumps of the main TAA's inputs in `captures/taa_inputs`), `tools/taa_inputs_region.py`,
+`tools/taa_motion_check.py` and `tools/rdc_stencil_probe.py`. The fan is at about x 1130-1850, y 180-320.
+
+- The fan writes velocity, on 26% of that rectangle (its blades). From 10211 to 10212 they move 0.6 px at the median
+  (2.6 px at the tips); from 10212 to 10213, 37 px (115 px), probably a long game frame while RenderDoc saved the
+  previous capture.
+- The add-on's motion vectors are right. Following them from the later frame lands each blade pixel on the same
+  surface in the earlier frame's scene color (with the jitter shift below). Median color error relative to the
+  median luma: 0.026 against 0.48-1.50 for none, mirrored, half or double at 37 px; 0.024 against 0.032-0.068 at
+  0.6 px.
+- The jitter the add-on hands DLSS matches the images. Static pixels with detail move by +1 times the difference of
+  the two frames' jitter as the add-on computes it (x right, y down): error 0.073 against 0.104 unshifted and 0.142
+  the other way (10211 to 10212; 0.076, 0.172 and 0.265 for 10212 to 10213). That is the projection's jitter in
+  pixels, as NVIDIA asks (DLSS Programming Guide of 31 March 2026, 3.7.3).
+- No responsive AA: the stencil is 0 on every pixel of the frame, in the raw dump and through RenderDoc's pixel
+  picker (2,916 pixels, the fan included). There is no mask for DLSS's bias-current-color input to take from it.
+- No dilation. The guide (3.6.2): render-resolution motion vectors "do not need to be dilated, DLSS dilates them
+  internally"; dilated display-resolution ones are "not the preferred option". The game's TAA does dilate (depth and
+  velocity from the nearest of the four diagonal neighbors two pixels away, UE's `AA_CROSS` 2, as its DXIL shows), but
+  DLSS keeps getting the plain ones. The D32S8 depth is fine (3.3: "any depth-stencil format").
+- The one input that departs from the guide is the jitter pattern. All 16 positions the add-on logged on 2026-11-03
+  are UE 4.27's 16-phase sequence for TAA without upsampling: Halton (2, 3) bent into a Gaussian
+  (`r.TemporalAAFilterSize` 1) inside a disc of radius 0.5, so the pixel's corners (21.5% of its area) are never
+  sampled. DLSS is trained on Halton over the whole pixel (3.7.1). Stock 4.27 jitters that way (`Halton(i, 2) - 0.5`,
+  `Halton(i, 3) - 0.5`) only with temporal upsampling, `r.TemporalAA.Upsampling 1` (in the exe), which also switches
+  the TAA to its upsampling permutation: to confirm in a capture.
+
+Still to capture: a moving camera (to check the camera motion vectors), a battle, and the
+`r.TemporalAA.Upsampling=1` permutation (stage 3).

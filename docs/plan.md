@@ -57,11 +57,17 @@ Expected obstacles:
    prefers it to the game's TAA. Status 2026-10-22: built (`src/addon.cpp`, `src/motion_vectors.hlsl`; installs with
    `tools\deploy.ps1`) and running in game since ec95957 (DLAA at 3840x2160, F9 A/B). The user: better on thin hair,
    on a near pole and on a back wall (the TAA's horizontal lines are gone); moving ceiling fan blades look "a little
-   wavy". Next: check in the captures whether the fan writes velocity and has the responsive AA stencil bit
-   (`tools/rdc_taa_inputs.py`, `tools/taa_inputs_region.py`), then feed that bit to DLSS as its bias-current-color
-   mask, or set `r.VertexDeformationOutputsVelocity` (the exe has it) so shader-animated meshes write velocity.
+   wavy". 2026-11-03: an hour of play, about 420,000 DLSS frames without a failure. The fan check in the captures
+   ([recon.md](recon.md)) found DLSS's inputs right: the fan writes velocity, the motion vectors and the jitter match
+   the images, and no pixel has the responsive AA bit, so neither planned fix (that bit as the bias-current-color
+   mask, `r.VertexDeformationOutputsVelocity`) applies, and NVIDIA advises against dilating the motion vectors
+   ourselves. The one departure from NVIDIA's guidance is UE's 16-phase jitter pattern (a Gaussian disc that never
+   samples the pixel's corners), which the engine's temporal upsampling path replaces with uniform Halton: stage 3.
 3. **Upscaling.** `r.ScreenPercentage` with the engine's own temporal upsampling path, replaced by DLSS at that
-   dispatch; check the texture mip bias; render scale in the overlay. Exit: in-game test at 50-67%.
+   dispatch; check the texture mip bias; render scale in the overlay. Exit: in-game test at 50-67%. First step: a
+   capture with `r.TemporalAA.Upsampling 1` at 100% (`[SystemSettings]` in the user's
+   `%LOCALAPPDATA%\P3R\Saved\Config\WindowsNoEditor\Engine.ini` for that session) for the upsampling permutation's
+   bindings and its jitter; DLAA through that path then gets uniform Halton jitter too.
 4. **Release.** README, GitHub, Nexus (each confirmed with the user).
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
