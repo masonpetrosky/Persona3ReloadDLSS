@@ -21,7 +21,7 @@ try {
   if ($LASTEXITCODE) { throw 'CMake configure failed.' }
   cmake --build build
   if ($LASTEXITCODE) { throw 'Build failed.' }
-  Get-Item build\Persona3ReloadDLSS.addon64
+  Get-Item build\Persona3ReloadDLSS.addon64, build\Persona3ReloadHudFix.addon64
 } finally {
   Pop-Location
 }

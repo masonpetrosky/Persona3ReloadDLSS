@@ -50,6 +50,18 @@ what the add-on is doing. The add-on logs to `ReShade.log`, prefixed `[P3RDLSS]`
 | `GameExposure` | 1 | DLSS gets the game's eye adaptation exposure; 0 lets DLSS estimate one |
 | `MotionVectors` | 0 | development: 1 camera motion only, 2 none |
 
+## HUD fix (a second add-on)
+
+`Persona3ReloadHudFix.addon64` is for HDR mods that render the game's 8-bit back buffer onto a float copy, as RenoDX
+does: with them, a bright hard-edged shape appears over the minimap while the HUD slides in after unpausing. Unreal's
+HUD builds masks in the back buffer's alpha channel and blends content through them; an 8-bit target keeps every
+step in 0..1, a float copy does not. After each draw whose alpha blend can leave 0..1, the add-on draws the same
+geometry again, alpha only, with a Maximum(0) and a Minimum(1) blend, which is what the 8-bit target did; on a real
+8-bit target that changes nothing. It is independent of the DLSS add-on and does not change RenoDX. The overlay (Add-ons
+tab) switches it off for a comparison and shows how many draws it clamps; `Persona3ReloadHudFix.ini` keeps that
+switch. Install with `tools\deploy_hud_fix.ps1` (backup first, `-Uninstall` to remove). Details in
+[docs/recon.md](docs/recon.md) and [docs/plan.md](docs/plan.md).
+
 ## Credits and licenses
 
 This add-on: MIT. NVIDIA's DLSS SDK under NVIDIA's license (not in the repository; `tools\fetch_dlss_sdk.ps1`

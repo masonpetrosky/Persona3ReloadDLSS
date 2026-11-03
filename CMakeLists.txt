@@ -50,3 +50,31 @@ target_include_directories(Persona3ReloadDLSS PRIVATE src third_party/imgui ${SH
 target_include_directories(Persona3ReloadDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
 target_link_libraries(Persona3ReloadDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12 dxgi)
 set_target_properties(Persona3ReloadDLSS PROPERTIES SUFFIX ".addon64")
+
+# The HUD fix (docs/plan.md, "HUD fix"), a separate add-on. Its pixel shaders go into pipelines with the game's DXIL
+# vertex shaders, so they are DXIL too, from the Windows SDK's dxc (which signs them with the SDK's dxil.dll):
+# dxil_shader(<symbol> <file> <profile> <entry> [defines]) writes ${SHADER_DIR}/<symbol>.h.
+find_program(DXC dxc REQUIRED)
+set(HUD_SHADER_HEADERS)
+function(dxil_shader symbol file profile entry)
+  set(defines)
+  foreach(define ${ARGN})
+    list(APPEND defines -D ${define})
+  endforeach()
+  set(header ${SHADER_DIR}/${symbol}.h)
+  add_custom_command(
+    OUTPUT ${header}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
+    COMMAND ${DXC} -nologo -T ${profile} -E ${entry} -O3 ${defines} -Vn ${symbol} -Fh ${header}
+            ${CMAKE_SOURCE_DIR}/src/${file}
+    DEPENDS src/${file}
+    VERBATIM)
+  set(HUD_SHADER_HEADERS ${HUD_SHADER_HEADERS} ${header} PARENT_SCOPE)
+endfunction()
+
+dxil_shader(kClampAlphaFloorPs hud_fix/clamp_alpha.hlsl ps_6_0 main VALUE=0)
+dxil_shader(kClampAlphaCeilingPs hud_fix/clamp_alpha.hlsl ps_6_0 main VALUE=1)
+
+add_library(Persona3ReloadHudFix SHARED src/hud_fix/addon.cpp ${HUD_SHADER_HEADERS})
+target_include_directories(Persona3ReloadHudFix PRIVATE third_party/reshade third_party/imgui ${SHADER_DIR})
+set_target_properties(Persona3ReloadHudFix PROPERTIES SUFFIX ".addon64")

@@ -77,6 +77,35 @@ Expected obstacles:
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
 
+## HUD fix: RenoDX's minimap flash (a second add-on)
+
+Cause ([recon.md](recon.md), "The minimap flash under RenoDX"): Unreal's Slate HUD builds a mask in the 8-bit back
+buffer's alpha channel and blends content through it; RenoDX renders onto a float copy, where those blends leave 0..1.
+
+What RenoDX does (its source, `clshortfuse/renodx` at 43c067b, read 2026-11-03): its Unreal add-on uses resource
+cloning with the generic (non-D3D12) events, so right after each of the game's `OMSetRenderTargets` it binds its float
+clone's views instead (`ApplyRenderTargetClones`); pipelines are not touched (its `create_pipeline` hook is commented
+out), so the game's B8G8R8A8 pipelines blend into the float clone. Its shader module swaps pipelines and pushes its
+settings at draw time, but only for the shaders it replaces (CRC32 of the bytecode): the HUD's Slate shaders (VS
+`0xe2ef73db`, PS `0x30094104` and `0x50b157ec`) are not among its 810 runtime replacements, while the LUT builder
+(`0xebb3e98c`) is, which confirms the hash.
+
+Approach: `Persona3ReloadHudFix.addon64`, our own ReShade add-on, independent of the DLSS one and of RenoDX's code.
+- At `init_pipeline`, for each graphics pipeline with an 8-bit color target whose alpha blend can leave 0..1 (an
+  adding or subtracting equation, checked over a grid of source and destination alpha), it creates one or two
+  "clamp" pipelines: the same state and vertex shader, its own pixel shader (alpha 0 or 1, DXIL like the game's), an
+  alpha-only write mask and a Maximum (floor at 0) or Minimum (ceiling at 1) blend, depth and stencil writes off.
+- At a draw with such a pipeline bound, it records the game's draw itself, then the same draw with the clamp
+  pipelines, binds the game's pipeline again and skips the original call. Its draw callbacks register after every
+  add-on has loaded, so they run after RenoDX's. Whatever render target is bound (RenoDX's clone) receives all three.
+- On an 8-bit target the clamp changes nothing; on the float clone it does what the 8-bit target did.
+
+Checks:
+1. Build, load next to RenoDX and the DLSS add-on: ReShade.log lists the pipelines that got clamps; no errors.
+2. Its own counters (log and overlay): clamped draws per frame; zero while no HUD is on screen.
+3. In game (only the user can judge it): no bright shape over the minimap while the HUD slides in after unpausing,
+   nothing else in the HUD changes; frame time unchanged.
+
 ## Workflow
 
 - Captures: `tools\launch_rdc.bat` (opened through explorer.exe) starts the game under RenderDoc with ReShade off for
