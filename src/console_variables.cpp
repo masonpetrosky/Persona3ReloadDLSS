@@ -104,12 +104,11 @@ std::vector<const uint8_t*> NameLoads(const wchar_t* name) {
   return loads;
 }
 
-}  // namespace
-
-// UE 4.27 inlines TAutoConsoleVariable<int32>'s constructor: the console manager's RegisterConsoleVariable (name in
-// rdx) returns the variable in rax, which goes to the static object's Target (mov [rip+X], rax); its AsVariableInt()
-// result, the TConsoleVariableData, goes to the next field, Ref (mov [rip+X+8], rax), a few instructions later.
-int32_t* FindIntConsoleVariable(const wchar_t* name, std::string* detail) {
+// UE 4.27 inlines TAutoConsoleVariable<T>'s constructor: the console manager's RegisterConsoleVariable (name in rdx)
+// returns the variable in rax, which goes to the static object's Target (mov [rip+X], rax); its AsVariableInt() or
+// AsVariableFloat() result, the TConsoleVariableData, goes to the next field, Ref (mov [rip+X+8], rax), a few
+// instructions later. The data starts with the two copies of the value (4 bytes each for int32 and float).
+void* FindConsoleVariableData(const wchar_t* name, std::string* detail) {
   const std::vector<const uint8_t*> loads = NameLoads(name);
   if (loads.empty()) {
     if (detail != nullptr) *detail = "no code loads the name";
@@ -123,12 +122,11 @@ int32_t* FindIntConsoleVariable(const wchar_t* name, std::string* detail) {
     }
     for (size_t i = 0; i + 1 < stores.size(); ++i) {
       if (stores[i + 1] != stores[i] + 8 || !Readable(stores[i + 1], sizeof(void*))) continue;
-      auto* const values = *reinterpret_cast<int32_t* const*>(stores[i + 1]);
+      void* const values = *reinterpret_cast<void* const*>(stores[i + 1]);
       if (values == nullptr || !Readable(values, 2 * sizeof(int32_t))) continue;
       if (detail != nullptr) {
         char text[96];
-        std::snprintf(text, sizeof(text), "registered at %p, values at %p", static_cast<const void*>(load),
-                      static_cast<void*>(values));
+        std::snprintf(text, sizeof(text), "registered at %p, values at %p", static_cast<const void*>(load), values);
         *detail = text;
       }
       return values;
@@ -136,6 +134,16 @@ int32_t* FindIntConsoleVariable(const wchar_t* name, std::string* detail) {
   }
   if (detail != nullptr) *detail = std::to_string(loads.size()) + " name load(s), none in the expected pattern";
   return nullptr;
+}
+
+}  // namespace
+
+int32_t* FindIntConsoleVariable(const wchar_t* name, std::string* detail) {
+  return static_cast<int32_t*>(FindConsoleVariableData(name, detail));
+}
+
+float* FindFloatConsoleVariable(const wchar_t* name, std::string* detail) {
+  return static_cast<float*>(FindConsoleVariableData(name, detail));
 }
 
 }  // namespace p3rdlss

@@ -13,5 +13,7 @@ namespace p3rdlss {
 // [0] the game thread's copy, [1] the render thread's), or null. `detail` receives how it was found or why not.
 // Call after the executable's static initializers have run (from the device creation on).
 int32_t* FindIntConsoleVariable(const wchar_t* name, std::string* detail);
+// The same for a TAutoConsoleVariable<float>, whose registration the compiler lays out the same way.
+float* FindFloatConsoleVariable(const wchar_t* name, std::string* detail);
 
 }  // namespace p3rdlss

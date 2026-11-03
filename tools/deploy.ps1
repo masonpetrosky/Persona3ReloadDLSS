@@ -61,6 +61,10 @@ ToggleKey=120
 Preset=0
 ; The camera jitter's phases while DLSS runs (r.TemporalAASamples); 0 keeps the game's.
 JitterPhases=16
+; 1: while DLSS runs, the engine's temporal upsampling path (Halton jitter over the whole pixel); 0: the game's path.
+UpsamplingPath=1
+; The texture mip bias on that path; NVIDIA recommends -1.0 for DLAA, toward 0 if fine textures shimmer.
+MipBias=-1.00
 ; 1: DLSS gets the game's eye adaptation exposure; 0: DLSS estimates one.
 GameExposure=1
 '@ | Set-Content -Path $ini -Encoding ascii

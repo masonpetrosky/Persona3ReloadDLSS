@@ -70,8 +70,9 @@ Expected obstacles:
    permutation's bindings and its jitter; DLAA through that path then gets uniform Halton jitter too.
    2026-11-03: captured (recon.md, "The temporal upsampling permutation"): uniform Halton confirmed, same bindings and
    offsets. The add-on replaces that permutation too and, while DLSS runs, sets `r.TemporalAA.Upsampling` 1 (setting
-   `UpsamplingPath`, default on); built, not installed yet. Still open on this path: the -0.3 texture mip bias it
-   brings (NVIDIA: -1.0 for DLAA), and whether the dorm's planar reflection behaves the same.
+   `UpsamplingPath`, default on); built, not installed yet. The engine's mip bias on that path is -0.3; the add-on
+   sets NVIDIA's -1.0 for DLAA instead (`MipBias`, `r.ViewTextureMipBias.Offset`), to judge in game for shimmer on fine
+   textures. Still open: whether the dorm's planar reflection behaves the same on this path.
 4. **Release.** README, GitHub, Nexus (each confirmed with the user).
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.

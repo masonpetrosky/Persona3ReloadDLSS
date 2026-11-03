@@ -15,10 +15,13 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
+#include <locale.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -123,6 +126,10 @@ struct Config {
   // which jitters the camera with a uniform Halton sequence over the whole pixel, the pattern NVIDIA trains DLSS on.
   // The game's own TAA path bends Halton into a Gaussian disc that never samples the pixel's corners.
   bool upsampling_path = true;
+  // The texture mip bias on that path while DLSS runs (r.ViewTextureMipBias.Offset; the engine's default there is
+  // -0.3, the game's own path uses 0). NVIDIA's DLSS guide (3.5): native bias + log2(render / display width) - 1, so
+  // -1 for DLAA; less negative if fine textures shimmer, never above 0.
+  float mip_bias = -1.0f;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
 };
@@ -154,6 +161,10 @@ std::string g_jitter_detail;
 std::atomic<int32_t*> g_taa_upsampling{nullptr};
 int32_t g_upsampling_game[2] = {0, 0};
 std::string g_upsampling_detail;
+// r.ViewTextureMipBias.Offset (a float variable) in the same layout and the same way.
+std::atomic<float*> g_mip_bias_offset{nullptr};
+float g_mip_bias_game[2] = {0.0f, 0.0f};
+std::string g_mip_bias_detail;
 std::atomic<int> g_last_permutation{kNotTaa};  // the TAA permutation DLSS replaced last
 
 std::atomic<uint64_t> g_frame{0};
@@ -209,12 +220,33 @@ void WriteInt(const wchar_t* key, int value) {
   WritePrivateProfileStringW(L"Persona3ReloadDLSS", key, std::to_wstring(value).c_str(), g_ini_path.c_str());
 }
 
+// Decimal numbers in the ini always use a point, whatever the locale.
+_locale_t CLocale() {
+  static const _locale_t locale = _create_locale(LC_NUMERIC, "C");
+  return locale;
+}
+
+float ReadFloat(const wchar_t* key, float fallback) {
+  wchar_t text[32] = {};
+  GetPrivateProfileStringW(L"Persona3ReloadDLSS", key, L"", text, 32, g_ini_path.c_str());
+  wchar_t* end = nullptr;
+  const float value = _wcstof_l(text, &end, CLocale());
+  return end != text && std::isfinite(value) ? value : fallback;
+}
+
+void WriteFloat(const wchar_t* key, float value) {
+  wchar_t text[32];
+  _swprintf_s_l(text, 32, L"%.2f", CLocale(), value);
+  WritePrivateProfileStringW(L"Persona3ReloadDLSS", key, text, g_ini_path.c_str());
+}
+
 void LoadConfig() {
   g_config.enabled = ReadInt(L"Enabled", 1) != 0;
   g_config.preset = ReadInt(L"Preset", 0);
   g_config.toggle_key = ReadInt(L"ToggleKey", VK_F9);
   g_config.jitter_phases = std::clamp(ReadInt(L"JitterPhases", 16), 0, 64);
   g_config.upsampling_path = ReadInt(L"UpsamplingPath", 1) != 0;
+  g_config.mip_bias = std::clamp(ReadFloat(L"MipBias", -1.0f), -2.0f, 0.0f);
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -225,6 +257,7 @@ void SaveConfig() {
   WriteInt(L"ToggleKey", g_config.toggle_key);
   WriteInt(L"JitterPhases", g_config.jitter_phases);
   WriteInt(L"UpsamplingPath", g_config.upsampling_path);
+  WriteFloat(L"MipBias", g_config.mip_bias);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
 }
@@ -796,6 +829,24 @@ void StartNvidia(ID3D12Device* device) {
     Log(reshade::log::level::warning, "r.TemporalAA.Upsampling not found (" + g_upsampling_detail +
                                           "); DLSS runs on the game's TAA path and its jitter pattern.");
   }
+  float* bias = p3rdlss::FindFloatConsoleVariable(L"r.ViewTextureMipBias.Offset", &g_mip_bias_detail);
+  // A small number of mip levels (the engine's default is -0.3).
+  const auto is_bias = [](float v) { return std::isfinite(v) && v >= -8.0f && v <= 8.0f; };
+  if (bias != nullptr && !(is_bias(bias[0]) && is_bias(bias[1]))) {
+    g_mip_bias_detail += ", but its values are no mip bias";
+    bias = nullptr;
+  }
+  if (bias != nullptr) {
+    g_mip_bias_game[0] = bias[0];
+    g_mip_bias_game[1] = bias[1];
+    g_mip_bias_offset = bias;
+    char text[64];
+    std::snprintf(text, sizeof(text), "; the game's value is %.2f.", bias[0]);
+    Log(reshade::log::level::info, "r.ViewTextureMipBias.Offset " + g_mip_bias_detail + text);
+  } else {
+    Log(reshade::log::level::warning, "r.ViewTextureMipBias.Offset not found (" + g_mip_bias_detail +
+                                          "); the upsampling path keeps the engine's texture mip bias.");
+  }
   const fs::path log_dir = g_data_dir / L"ngx";
   std::error_code ec;
   fs::create_directories(log_dir, ec);
@@ -836,6 +887,10 @@ void OnDestroyDevice(device* dev) {
   if (int32_t* const upsampling = g_taa_upsampling.exchange(nullptr)) {
     upsampling[0] = g_upsampling_game[0];
     upsampling[1] = g_upsampling_game[1];
+  }
+  if (float* const bias = g_mip_bias_offset.exchange(nullptr)) {
+    bias[0] = g_mip_bias_game[0];
+    bias[1] = g_mip_bias_game[1];
   }
   std::lock_guard lock(g_dlss_mutex);
   for (const Retired& r : g_retired) {
@@ -897,6 +952,14 @@ void ApplyEngineVariables() {
       }
     }
     if (changed) g_reset = true;
+  }
+  // The texture mip bias, which the engine applies on the upsampling path only.
+  if (float* const bias = g_mip_bias_offset.load()) {
+    const bool ours = dlss && g_config.upsampling_path && g_taa_upsampling.load() != nullptr;
+    for (int i = 0; i < 2; ++i) {
+      const float want = ours ? g_config.mip_bias : g_mip_bias_game[i];
+      if (bias[i] != want) bias[i] = want;
+    }
   }
 }
 
@@ -981,8 +1044,14 @@ void OnOverlay(effect_runtime*) {
   ImGui::SetItemTooltip("While DLSS runs, the engine renders through its temporal upsampling path at 100%% "
                         "(r.TemporalAA.Upsampling 1): the camera jitter covers the whole pixel in a Halton sequence, "
                         "the pattern NVIDIA trains DLSS on. The game's own TAA path bends it into a disc that never "
-                        "samples the pixel's corners. On this path the engine also sharpens textures a little (mip "
-                        "bias -0.3).");
+                        "samples the pixel's corners. This path also applies the texture mip bias below.");
+  ImGui::BeginDisabled(!g_config.upsampling_path);
+  ImGui::SliderFloat("Texture mip bias", &g_config.mip_bias, -2.0f, 0.0f, "%.1f");
+  if (ImGui::IsItemDeactivatedAfterEdit()) SaveConfig();
+  ImGui::EndDisabled();
+  ImGui::SetItemTooltip("Sharper (more negative) or softer texture sampling while DLSS runs on the upsampling path "
+                        "(r.ViewTextureMipBias.Offset). NVIDIA recommends -1.0 for DLAA. If fine, high-contrast "
+                        "textures shimmer or show moire in motion, move it toward 0. The game's own TAA path uses 0.");
   if (ImGui::Checkbox("Game exposure", &g_config.game_exposure)) SaveConfig();
   ImGui::SetItemTooltip("Give DLSS the game's eye adaptation exposure. Off lets DLSS estimate one.");
 
@@ -1002,6 +1071,11 @@ void OnOverlay(effect_runtime*) {
     else
       ImGui::TextWrapped("Temporal upsampling path: not available (r.TemporalAA.Upsampling not found: %s)",
                          g_upsampling_detail.c_str());
+    if (const float* const bias = g_mip_bias_offset.load())
+      ImGui::Text("Texture mip bias on that path: %.2f (the engine's default %.2f)", bias[1], g_mip_bias_game[1]);
+    else
+      ImGui::TextWrapped("Texture mip bias: the engine's (r.ViewTextureMipBias.Offset not found: %s)",
+                         g_mip_bias_detail.c_str());
     const int permutation = g_last_permutation.load();
     if (permutation != kNotTaa)
       ImGui::Text("DLSS last replaced the TAA pass of %s.", kTaaPermutations[permutation].name);
@@ -1022,10 +1096,11 @@ void Initialize(HMODULE module) {
   g_data_dir = g_addon_dir / L"Persona3ReloadDLSS";
   g_ini_path = g_addon_dir / L"Persona3ReloadDLSS.ini";
   LoadConfig();
-  char text[192];
-  std::snprintf(text, sizeof(text), "Loaded. DLSS %s; toggle key %s; %d jitter phases; upsampling path %s; preset %d.",
+  char text[224];
+  std::snprintf(text, sizeof(text),
+                "Loaded. DLSS %s; toggle key %s; %d jitter phases; upsampling path %s, mip bias %.2f; preset %d.",
                 g_config.enabled ? "on" : "off", KeyName(g_config.toggle_key).c_str(), g_config.jitter_phases,
-                g_config.upsampling_path ? "on" : "off", g_config.preset);
+                g_config.upsampling_path ? "on" : "off", g_config.mip_bias, g_config.preset);
   Log(reshade::log::level::info, text);
 }
 
