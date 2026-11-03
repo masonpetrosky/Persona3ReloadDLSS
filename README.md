@@ -44,7 +44,7 @@ what the add-on is doing. The add-on logs to `ReShade.log`, prefixed `[P3RDLSS]`
 | `Enabled` | 1 | DLSS in place of the game's TAA |
 | `Mode` | 0 | 0 DLAA (100%), 1 Quality (67%), 2 Balanced (58%), 3 Performance (50%), 4 Ultra Performance (33%): the render scale while DLSS runs (`r.ScreenPercentage`, on the upsampling path); DLSS upscales to the output |
 | `ToggleKey` | 120 (F9) | switches between DLSS and the game's TAA in game (not while Alt, Ctrl or Shift is held) |
-| `Preset` | 0 | 0 = NVIDIA's default (K); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M |
+| `Preset` | 0 | 0 = NVIDIA's default per mode (DLSS 310: K for DLAA, Quality and Balanced, M for Performance, L for Ultra Performance); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M for every mode |
 | `JitterPhases` | 16 | the camera jitter's phases while DLSS runs; 0 keeps the game's |
 | `UpsamplingPath` | 1 | while DLSS runs, the engine's temporal upsampling path: Halton jitter over the whole pixel and the texture mip bias below; 0 keeps the game's TAA path (jitter in a disc, mip bias 0) |
 | `MipBias` | -1.0 | the texture mip bias on that path (`r.ViewTextureMipBias.Offset`, the engine's default -0.3): NVIDIA's recommendation for DLAA is -1.0; toward 0 if fine textures shimmer |

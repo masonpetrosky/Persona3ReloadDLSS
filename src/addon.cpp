@@ -1398,7 +1398,11 @@ void OnOverlay(effect_runtime*) {
                         "quality for frame rate. Needs the Halton jitter path below; RenderScale in the ini "
                         "overrides it.");
 
-  const char* const preset_names[] = {"Default (K)", "E (older CNN model, lightest)", "J", "K", "L", "M"};
+  // NVIDIA's default depends on the mode (DLSS 310: K for DLAA, Quality and Balanced, M for Performance, L for Ultra
+  // Performance); the list names the one the current mode gets.
+  const std::string default_name = std::string("NVIDIA's default for this mode (") +
+                                   p3rdlss::DefaultPresetLetter(RenderScale()) + ")";
+  const char* const preset_names[] = {default_name.c_str(), "E (older CNN model, lightest)", "J", "K", "L", "M"};
   static const int kPresetValues[] = {0, 5, 10, 11, 12, 13};
   constexpr int kPresetCount = 6;
   int index = 0;
@@ -1409,9 +1413,9 @@ void OnOverlay(effect_runtime*) {
     g_recreate = true;
     SaveConfig();
   }
-  ImGui::SetItemTooltip("K: transformer model, NVIDIA's default for DLAA.\n"
-                        "L and M: newer transformer models, which cost more than K (much more on RTX 20 and 30 "
-                        "cards).\nE: the older CNN model, about half of K's cost.");
+  ImGui::SetItemTooltip("NVIDIA's default picks per mode: K (transformer) for DLAA, Quality and Balanced, M for "
+                        "Performance, L for Ultra Performance.\nA letter here applies to every mode. L and M cost more "
+                        "than K (much more on RTX 20 and 30 cards); E is the older CNN model, about half of K's cost.");
 
   if (ImGui::SliderInt("Jitter phases", &g_config.jitter_phases, 0, 32)) g_reset = true;
   if (ImGui::IsItemDeactivatedAfterEdit()) SaveConfig();

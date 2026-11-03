@@ -59,7 +59,7 @@ Enabled=1
 ; 0 DLAA (100%), 1 Quality (67%), 2 Balanced (58%), 3 Performance (50%), 4 Ultra Performance (33%).
 Mode=0
 ToggleKey=120
-; 0: NVIDIA's default (K); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M.
+; 0: NVIDIA's default per mode (K; M for Performance, L for Ultra Performance); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M.
 Preset=0
 ; The camera jitter's phases while DLSS runs (r.TemporalAASamples); 0 keeps the game's.
 JitterPhases=16

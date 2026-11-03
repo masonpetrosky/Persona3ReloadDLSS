@@ -177,9 +177,14 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   max_width_ = max_w;
   max_height_ = max_h;
   auto_exposure_ = auto_exposure;
-  char text[192];
-  std::snprintf(text, sizeof(text), "running %s (preset %d), render %ux%u to %ux%u, output %ux%u (%s)", mode.name,
-                preset, min_w, min_h, max_w, max_h, width, height,
+  char text[224];
+  char preset_text[40];
+  if (preset == 0)
+    std::snprintf(preset_text, sizeof(preset_text), "NVIDIA's default, %s", DefaultPresetLetter(scale));
+  else
+    std::snprintf(preset_text, sizeof(preset_text), "%d", preset);
+  std::snprintf(text, sizeof(text), "running %s (preset %s), render %ux%u to %ux%u, output %ux%u (%s)", mode.name,
+                preset_text, min_w, min_h, max_w, max_h, width, height,
                 !hdr ? "after tonemapping" : auto_exposure ? "auto-exposure" : "game exposure");
   status_ = text;
   return true;
