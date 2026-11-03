@@ -263,6 +263,9 @@ std::atomic<uint64_t> g_last_dlss_frame{0};  // g_frame when DLSS last ran
 std::atomic<uint32_t> g_out_width{0}, g_out_height{0};
 std::atomic<uint32_t> g_render_width{0}, g_render_height{0};  // DLSS's input size last time it ran
 std::atomic<float> g_last_jitter_x{0.0f}, g_last_jitter_y{0.0f};
+// DLSS frames whose jitter sat at the pixel's corner (-0.5, -0.5), which no Halton point or the game's disc reaches:
+// the engine's signed-byte sample index wrapped past 127 (more than 128 phases, docs/recon.md).
+std::atomic<uint64_t> g_corner_jitter_frames{0};
 
 std::shared_mutex g_taa_mutex;
 std::unordered_map<uint64_t, int> g_taa_pipelines;  // pipeline handle -> TAA permutation
@@ -960,17 +963,18 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   g_render_height = render_height;
   g_last_jitter_x = jitter_x;
   g_last_jitter_y = jitter_y;
+  if (std::fabs(jitter_x + 0.5f) < 1e-3f && std::fabs(jitter_y + 0.5f) < 1e-3f) ++g_corner_jitter_frames;
   const uint64_t frames = ++g_dlss_frames;
   if (frames == 1 || frames % 3000 == 0) {
     const int32_t* const samples = g_taa_samples.load();
-    char text[256];
+    char text[320];
     std::snprintf(text, sizeof(text),
                   "DLSS frame %llu (TAA dispatch %llu): %ux%u to %ux%u, jitter %+.3f %+.3f px, %d jitter phases, "
-                  "pre-exposure %.3g, camera cut %d, reset %d, failures %llu",
+                  "corner jitter frames %llu, pre-exposure %.3g, camera cut %d, reset %d, failures %llu",
                   static_cast<unsigned long long>(frames), static_cast<unsigned long long>(dispatch), render_width,
                   render_height, width, height, jitter_x, jitter_y, samples != nullptr ? samples[1] : -1,
-                  c.pre_exposure, c.camera_cut ? 1 : 0, in.reset ? 1 : 0,
-                  static_cast<unsigned long long>(g_failures.load()));
+                  static_cast<unsigned long long>(g_corner_jitter_frames.load()), c.pre_exposure,
+                  c.camera_cut ? 1 : 0, in.reset ? 1 : 0, static_cast<unsigned long long>(g_failures.load()));
     Log(reshade::log::level::info, text);
   }
   return true;
@@ -1516,6 +1520,10 @@ void OnOverlay(effect_runtime*) {
   else if (g_config.enabled)
     ImGui::TextUnformatted("Not running this frame (the game's TAA runs).");
   if (g_failures.load() != 0) ImGui::Text("Failed evaluations: %llu", static_cast<unsigned long long>(g_failures.load()));
+  if (g_corner_jitter_frames.load() != 0)
+    ImGui::TextWrapped("Jitter stuck at the pixel's corner in %llu frames (the engine's sample index wrapped: more "
+                       "than 128 phases).",
+                       static_cast<unsigned long long>(g_corner_jitter_frames.load()));
 }
 
 void Initialize(HMODULE module) {
