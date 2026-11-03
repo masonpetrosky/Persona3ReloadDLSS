@@ -161,5 +161,28 @@ With DLAA the user saw the lounge's moving ceiling fan blades "a little wavy". C
   `Halton(i, 3) - 0.5`) only with temporal upsampling, `r.TemporalAA.Upsampling 1` (in the exe), which also switches
   the TAA to its upsampling permutation: to confirm in a capture.
 
-Still to capture: a moving camera (to check the camera motion vectors), a battle, and the
-`r.TemporalAA.Upsampling=1` permutation (stage 3).
+### The temporal upsampling permutation (2026-11-03)
+
+`captures/p3r_frame9458`-`9460`: three consecutive frames at the School Entranceway (4/21 After School), the
+protagonist running and the camera following, taken with `tools\launch_rdc_upsampling.bat`, which sets
+`r.TemporalAA.Upsampling 1` for the session in the user's Engine.ini (the game honors `[SystemSettings]` there).
+
+- The main TAA dispatch (event 8122 in 9458, 480x270 groups) is another TAAStandalone permutation: DXIL hash
+  `979c50e34b7323ab38a40f496667bffd` (container digest `9abf99a7...`). Same bindings (t0-t5, u0, root CBVs b0 and
+  b1, same formats) and the same View. `$Globals` is 464 bytes instead of 412: the same fields at +0 to +8
+  (`bCameraCut` +8) and +240 to +400; other values at +32 to +223 (no `SampleWeights`, `PlusWeights`); +448
+  `TemporalJitterPixels` (-0.25, +0.1667 in 9458, equal to the add-on's jitter from `View.TemporalAAJitter`), then
+  1.0 and 1.0.
+- Its jitter is the uniform Halton sequence, `Halton(i, 2) - 0.5`, `Halton(i, 3) - 0.5`: 9458 to 9460 alternate
+  (-0.250, +0.167) and (0.000, -0.167), its first two points (this area's `r.TemporalAASamples` is 2).
+- `View.MaterialTextureMipBias` (+2292) is -0.3 on this path (0 on the other), UE's default
+  `r.ViewTextureMipBias.Offset`; `MaterialTextureDerivativeMultiply` (+2296) follows (2^-0.3). Then `Random` +2300,
+  `FrameNumber` +2304, `StateFrameIndexMod8` +2308. NVIDIA's guide (3.5) asks for -1.0 with DLAA.
+- Camera motion vectors (`tools/taa_motion_check.py` on the dumps in `captures/taa_inputs_up`, which now keep the
+  View values): from 9458 to 9459 the camera moves pixels without velocity by 8.2 px at the median (18.5 px at 90%);
+  the add-on's camera motion from depth and `ClipToPrevClip` has a median color error of 0.243 against 0.909 for
+  none, 0.444-0.975 mirrored and 0.81-0.84 half or double. The running students' velocity (29.5 px): 0.025 against
+  0.043 and more. From 9459 to 9460, the game's long step after RenderDoc saved two frames (569 px): 0.599 against
+  1.108 and more (camera), 0.116 against 0.934 and more (velocity). The jitter sign is +1 again.
+
+Still to capture: a battle.

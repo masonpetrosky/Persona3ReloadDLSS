@@ -48,9 +48,19 @@ namespace fs = std::filesystem;
 
 // --- The game's TAA pass (docs/recon.md) -----------------------------------------------------------------------
 
-// TAAStandalone.usf MainCS, by the digest in its DXIL container's HASH part.
-constexpr uint8_t kTaaHash[16] = {0x20, 0x31, 0x52, 0x69, 0x4a, 0xc6, 0xf5, 0xd3,
-                                  0xb9, 0x8e, 0x54, 0x64, 0x59, 0x8f, 0x56, 0x69};
+// TAAStandalone.usf MainCS, by the digest in its DXIL container's HASH part. Two permutations with the same bindings
+// and the same constants at the offsets below: the game's own, and the engine's temporal upsampling pass, which runs
+// with r.TemporalAA.Upsampling 1 (here at 100%) and jitters the camera with a uniform Halton sequence.
+struct TaaPermutation {
+  uint8_t hash[16];
+  const char* name;
+};
+constexpr TaaPermutation kTaaPermutations[] = {
+    {{0x20, 0x31, 0x52, 0x69, 0x4a, 0xc6, 0xf5, 0xd3, 0xb9, 0x8e, 0x54, 0x64, 0x59, 0x8f, 0x56, 0x69}, "the game's TAA"},
+    {{0x97, 0x9c, 0x50, 0xe3, 0x4b, 0x73, 0x23, 0xab, 0x38, 0xa4, 0x0f, 0x49, 0x66, 0x67, 0xbf, 0xfd},
+     "the engine's temporal upsampling"},
+};
+constexpr int kNotTaa = -1;
 
 // Its registers.
 constexpr uint32_t kEyeAdaptationSrv = 0;  // 1x1 R32G32B32A32_FLOAT; x = the exposure the tonemapper applies
@@ -93,7 +103,7 @@ static_assert(sizeof(MotionConstants) == 24 * 4);
 
 struct __declspec(uuid("6d2f8a41-93c7-4e5b-a0d6-1f4b7c9e2a58")) CmdData {
   pipeline current = {0};  // the pipeline state the game set last
-  bool taa = false;        // it is the TAA's
+  int taa = kNotTaa;       // its TAA permutation (kTaaPermutations), if it is one
   // The root constant buffers the game set (SetComputeRootConstantBufferView) for the compute root signature
   // `cbv_layout`, by root parameter. The descriptor tracking only covers descriptor tables.
   pipeline_layout cbv_layout = {0};
@@ -109,6 +119,10 @@ struct Config {
   // The engine's camera jitter phases (r.TemporalAASamples) while DLSS runs; 0 keeps the game's. The game sets 2 in
   // the places seen so far, too few for DLSS, which wants 8 or more.
   int jitter_phases = 16;
+  // While DLSS runs, the engine renders through its temporal upsampling path (r.TemporalAA.Upsampling 1, at 100%),
+  // which jitters the camera with a uniform Halton sequence over the whole pixel, the pattern NVIDIA trains DLSS on.
+  // The game's own TAA path bends Halton into a Gaussian disc that never samples the pixel's corners.
+  bool upsampling_path = true;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
 };
@@ -135,6 +149,12 @@ std::atomic<uint64_t> g_nvidia_start_ms{0};
 // NVIDIA thread; g_jitter_detail says how, readable once g_nvidia_ready.
 std::atomic<int32_t*> g_taa_samples{nullptr};
 std::string g_jitter_detail;
+// r.TemporalAA.Upsampling's values in the same layout, and what they were when found (put back whenever DLSS does not
+// run, so F9 compares with the game's own TAA path); g_upsampling_detail says how, readable once g_nvidia_ready.
+std::atomic<int32_t*> g_taa_upsampling{nullptr};
+int32_t g_upsampling_game[2] = {0, 0};
+std::string g_upsampling_detail;
+std::atomic<int> g_last_permutation{kNotTaa};  // the TAA permutation DLSS replaced last
 
 std::atomic<uint64_t> g_frame{0};
 std::atomic<float> g_frame_time_ms{0.0f};
@@ -149,7 +169,7 @@ std::atomic<uint32_t> g_out_width{0}, g_out_height{0};
 std::atomic<float> g_last_jitter_x{0.0f}, g_last_jitter_y{0.0f};
 
 std::shared_mutex g_taa_mutex;
-std::unordered_set<uint64_t> g_taa_pipelines;
+std::unordered_map<uint64_t, int> g_taa_pipelines;  // pipeline handle -> TAA permutation
 
 // The motion vector pass and its textures, under g_dlss_mutex.
 resource g_motion = {0};  // R16G16_FLOAT, render pixels from this frame's position to the previous one
@@ -194,6 +214,7 @@ void LoadConfig() {
   g_config.preset = ReadInt(L"Preset", 0);
   g_config.toggle_key = ReadInt(L"ToggleKey", VK_F9);
   g_config.jitter_phases = std::clamp(ReadInt(L"JitterPhases", 16), 0, 64);
+  g_config.upsampling_path = ReadInt(L"UpsamplingPath", 1) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -203,6 +224,7 @@ void SaveConfig() {
   WriteInt(L"Preset", g_config.preset);
   WriteInt(L"ToggleKey", g_config.toggle_key);
   WriteInt(L"JitterPhases", g_config.jitter_phases);
+  WriteInt(L"UpsamplingPath", g_config.upsampling_path);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
 }
@@ -224,35 +246,39 @@ std::string KeyName(int vk) {
 // --- Pass detection --------------------------------------------------------------------------------------------
 
 // A DXIL container: "DXBC", its digest, version, size, part count and part offsets; each part starts with its
-// four-character code and size. The HASH part holds flags and the shader's digest.
-bool IsTaaShader(const shader_desc* cs) {
-  if (cs == nullptr || cs->code == nullptr || cs->code_size < 32) return false;
+// four-character code and size. The HASH part holds flags and the shader's digest. Returns the TAA permutation.
+int FindTaaPermutation(const shader_desc* cs) {
+  if (cs == nullptr || cs->code == nullptr || cs->code_size < 32) return kNotTaa;
   const auto* const code = static_cast<const uint8_t*>(cs->code);
-  if (std::memcmp(code, "DXBC", 4) != 0) return false;
+  if (std::memcmp(code, "DXBC", 4) != 0) return kNotTaa;
   uint32_t parts = 0;
   std::memcpy(&parts, code + 28, 4);
   for (uint32_t i = 0; i < parts && 32 + 4 * (size_t{i} + 1) <= cs->code_size; ++i) {
     uint32_t offset = 0;
     std::memcpy(&offset, code + 32 + 4 * i, 4);
     if (offset > cs->code_size || cs->code_size - offset < 28) continue;
-    if (std::memcmp(code + offset, "HASH", 4) == 0) return std::memcmp(code + offset + 12, kTaaHash, 16) == 0;
+    if (std::memcmp(code + offset, "HASH", 4) != 0) continue;
+    for (int p = 0; p < static_cast<int>(std::size(kTaaPermutations)); ++p)
+      if (std::memcmp(code + offset + 12, kTaaPermutations[p].hash, 16) == 0) return p;
+    return kNotTaa;
   }
-  return false;
+  return kNotTaa;
 }
 
 void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
   for (uint32_t i = 0; i < count; ++i) {
     if (subobjects[i].type != pipeline_subobject_type::compute_shader) continue;
-    if (!IsTaaShader(static_cast<const shader_desc*>(subobjects[i].data))) return;
+    const int permutation = FindTaaPermutation(static_cast<const shader_desc*>(subobjects[i].data));
+    if (permutation == kNotTaa) return;
     size_t total = 0;
     {
       std::unique_lock lock(g_taa_mutex);
-      g_taa_pipelines.insert(p.handle);
+      g_taa_pipelines[p.handle] = permutation;
       total = g_taa_pipelines.size();
     }
-    char text[96];
-    std::snprintf(text, sizeof(text), "Found the TAA shader (pipeline %llx, %zu so far).",
-                  static_cast<unsigned long long>(p.handle), total);
+    char text[160];
+    std::snprintf(text, sizeof(text), "Found the TAA shader of %s (pipeline %llx, %zu so far).",
+                  kTaaPermutations[permutation].name, static_cast<unsigned long long>(p.handle), total);
     Log(reshade::log::level::info, text);
     return;
   }
@@ -276,7 +302,8 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
   if (data == nullptr) return;
   data->current = p;
   std::shared_lock lock(g_taa_mutex);
-  data->taa = g_taa_pipelines.count(p.handle) != 0;
+  const auto it = g_taa_pipelines.find(p.handle);
+  data->taa = it != g_taa_pipelines.end() ? it->second : kNotTaa;
 }
 
 void OnPushDescriptors(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t param,
@@ -725,8 +752,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
 
 bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
-  if (data == nullptr || !data->taa) return false;
-  return ReplaceTaa(cmd_list, *data);
+  if (data == nullptr || data->taa == kNotTaa) return false;
+  if (!ReplaceTaa(cmd_list, *data)) return false;
+  if (g_last_permutation.exchange(data->taa) != data->taa)
+    Log(reshade::log::level::info,
+        std::string("DLSS replaces the TAA pass of ") + kTaaPermutations[data->taa].name + ".");
+  return true;
 }
 
 // --- Device and frame ------------------------------------------------------------------------------------------
@@ -746,6 +777,24 @@ void StartNvidia(ID3D12Device* device) {
   } else {
     Log(reshade::log::level::warning,
         "r.TemporalAASamples not found (" + g_jitter_detail + "); the camera jitter keeps the game's phases.");
+  }
+  int32_t* upsampling = p3rdlss::FindIntConsoleVariable(L"r.TemporalAA.Upsampling", &g_upsampling_detail);
+  // A switch: both copies 0 or 1 (the engine's default and the game's are 0).
+  const auto is_switch = [](int32_t v) { return v == 0 || v == 1; };
+  if (upsampling != nullptr && !(is_switch(upsampling[0]) && is_switch(upsampling[1]))) {
+    g_upsampling_detail += ", but its values " + std::to_string(upsampling[0]) + " and " +
+                           std::to_string(upsampling[1]) + " are no switch";
+    upsampling = nullptr;
+  }
+  if (upsampling != nullptr) {
+    g_upsampling_game[0] = upsampling[0];
+    g_upsampling_game[1] = upsampling[1];
+    g_taa_upsampling = upsampling;
+    Log(reshade::log::level::info, "r.TemporalAA.Upsampling " + g_upsampling_detail + "; the game's value is " +
+                                       std::to_string(upsampling[0]) + ".");
+  } else {
+    Log(reshade::log::level::warning, "r.TemporalAA.Upsampling not found (" + g_upsampling_detail +
+                                          "); DLSS runs on the game's TAA path and its jitter pattern.");
   }
   const fs::path log_dir = g_data_dir / L"ngx";
   std::error_code ec;
@@ -784,6 +833,10 @@ void OnDestroyDevice(device* dev) {
   // NGX starts within a second or two; ReShade may unload the add-on right after this.
   if (g_nvidia_thread.joinable()) g_nvidia_thread.join();
   if (int32_t* const samples = g_taa_samples.exchange(nullptr)) samples[1] = samples[0];
+  if (int32_t* const upsampling = g_taa_upsampling.exchange(nullptr)) {
+    upsampling[0] = g_upsampling_game[0];
+    upsampling[1] = g_upsampling_game[1];
+  }
   std::lock_guard lock(g_dlss_mutex);
   for (const Retired& r : g_retired) {
     if (r.view != 0) dev->destroy_resource_view(r.view);
@@ -822,14 +875,29 @@ bool KeyPressed(int vk) {
   return pressed;
 }
 
-// The jitter phases DLSS wants while it runs, the game's otherwise. The game's own changes of the variable land in
-// [0] first, so [0] keeps its value; the jitter reads [1].
-void ApplyJitterPhases() {
-  int32_t* const samples = g_taa_samples.load();
-  if (samples == nullptr) return;
-  const bool ours = g_config.enabled && g_config.jitter_phases > 0 && g_dlss_available;
-  const int32_t want = ours ? g_config.jitter_phases : samples[0];
-  if (samples[1] != want) samples[1] = want;
+// The engine's settings DLSS wants while it runs, the game's otherwise.
+void ApplyEngineVariables() {
+  const bool dlss = g_config.enabled && g_dlss_available;
+  // The jitter phases. The game's own changes of the variable land in [0] first, so [0] keeps its value; the jitter
+  // reads [1].
+  if (int32_t* const samples = g_taa_samples.load()) {
+    const int32_t want = dlss && g_config.jitter_phases > 0 ? g_config.jitter_phases : samples[0];
+    if (samples[1] != want) samples[1] = want;
+  }
+  // The temporal upsampling path and its uniform Halton jitter. Both copies are set, as which thread reads the
+  // variable is not known; a switch changes the jitter sequence, so DLSS starts its history over.
+  if (int32_t* const upsampling = g_taa_upsampling.load()) {
+    const bool ours = dlss && g_config.upsampling_path;
+    bool changed = false;
+    for (int i = 0; i < 2; ++i) {
+      const int32_t want = ours ? 1 : g_upsampling_game[i];
+      if (upsampling[i] != want) {
+        upsampling[i] = want;
+        changed = true;
+      }
+    }
+    if (changed) g_reset = true;
+  }
 }
 
 void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
@@ -855,7 +923,7 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
     SaveConfig();
     Log(reshade::log::level::info, g_config.enabled ? "DLSS on." : "DLSS off (game TAA).");
   }
-  ApplyJitterPhases();
+  ApplyEngineVariables();
 
   if (g_recreate.load() && g_nvidia_ready) {
     queue->wait_idle();
@@ -909,6 +977,12 @@ void OnOverlay(effect_runtime*) {
   ImGui::SetItemTooltip("While DLSS runs, the camera jitter cycles through this many sub-pixel positions "
                         "(r.TemporalAASamples). The game uses 2, which leaves DLSS too little to work with; NVIDIA "
                         "asks for at least 8. 0 keeps the game's.");
+  if (ImGui::Checkbox("Halton jitter (the engine's upsampling path)", &g_config.upsampling_path)) SaveConfig();
+  ImGui::SetItemTooltip("While DLSS runs, the engine renders through its temporal upsampling path at 100%% "
+                        "(r.TemporalAA.Upsampling 1): the camera jitter covers the whole pixel in a Halton sequence, "
+                        "the pattern NVIDIA trains DLSS on. The game's own TAA path bends it into a disc that never "
+                        "samples the pixel's corners. On this path the engine also sharpens textures a little (mip "
+                        "bias -0.3).");
   if (ImGui::Checkbox("Game exposure", &g_config.game_exposure)) SaveConfig();
   ImGui::SetItemTooltip("Give DLSS the game's eye adaptation exposure. Off lets DLSS estimate one.");
 
@@ -923,6 +997,14 @@ void OnOverlay(effect_runtime*) {
       ImGui::Text("Camera jitter: %d phases (the game asks for %d)", samples[1], samples[0]);
     else
       ImGui::TextWrapped("Camera jitter: the game's (r.TemporalAASamples not found: %s)", g_jitter_detail.c_str());
+    if (const int32_t* const upsampling = g_taa_upsampling.load())
+      ImGui::Text("Temporal upsampling path: %s", upsampling[1] != 0 ? "on" : "off");
+    else
+      ImGui::TextWrapped("Temporal upsampling path: not available (r.TemporalAA.Upsampling not found: %s)",
+                         g_upsampling_detail.c_str());
+    const int permutation = g_last_permutation.load();
+    if (permutation != kNotTaa)
+      ImGui::Text("DLSS last replaced the TAA pass of %s.", kTaaPermutations[permutation].name);
   }
   const uint64_t last = g_last_dlss_frame.load();
   if (g_dlss_frames.load() != 0 && last + 2 >= g_frame.load())
@@ -940,10 +1022,10 @@ void Initialize(HMODULE module) {
   g_data_dir = g_addon_dir / L"Persona3ReloadDLSS";
   g_ini_path = g_addon_dir / L"Persona3ReloadDLSS.ini";
   LoadConfig();
-  char text[160];
-  std::snprintf(text, sizeof(text), "Loaded. DLSS %s; toggle key %s; %d jitter phases; preset %d.",
+  char text[192];
+  std::snprintf(text, sizeof(text), "Loaded. DLSS %s; toggle key %s; %d jitter phases; upsampling path %s; preset %d.",
                 g_config.enabled ? "on" : "off", KeyName(g_config.toggle_key).c_str(), g_config.jitter_phases,
-                g_config.preset);
+                g_config.upsampling_path ? "on" : "off", g_config.preset);
   Log(reshade::log::level::info, text);
 }
 

@@ -1,19 +1,22 @@
 """Dumps the main TAA dispatch's input textures (raw bytes) from one or more captures, for offline analysis.
 
 Run inside RenderDoc's embedded Python (tools/rdc.sh tools/rdc_taa_inputs.py) with:
-  P3R_RDCS  ';'-separated .rdc captures
-  P3R_OUT   output folder; gets <capture>_t<slot>.bin per input and <capture>.json describing them
+  P3R_RDCS      ';'-separated .rdc captures
+  P3R_OUT       output folder; gets <capture>_t<slot>.bin per input and <capture>.json describing them
+  P3R_TAA_HASH  optional: ','-separated DXIL hashes of the TAA permutation (default: the one in docs/recon.md)
 The main TAA dispatch is the TAAStandalone dispatch whose velocity input (t3) is not the 1x1 dummy (see
 docs/recon.md). Depth-stencil textures come out as RenderDoc returns them (for D32S8: depth and stencil interleaved,
-8 bytes per pixel).
+8 bytes per pixel). The .json also keeps the View uniform buffer's values the motion vectors need (TemporalAAJitter,
+ClipToPrevClip, ViewSizeAndInvSize, ViewRectMin; UE 4.27 offsets, docs/recon.md).
 """
 import json
 import os
+import struct
 import traceback
 
 import renderdoc as rd
 
-TAA_HASH = "203152694ac6f5d3b98e5464598f5669"
+TAA_HASHES = set(os.environ.get("P3R_TAA_HASH", "203152694ac6f5d3b98e5464598f5669").split(","))
 OUT_DIR = os.environ["P3R_OUT"]
 os.makedirs(OUT_DIR, exist_ok=True)
 LOG = open(os.path.join(OUT_DIR, "dump.log"), "w", encoding="utf-8")
@@ -63,7 +66,7 @@ def dump_capture(path):
         key = int(refl.resourceId)
         if key not in hashes:
             hashes[key] = shader_hash(refl)
-        if TAA_HASH not in hashes[key]:
+        if not (TAA_HASHES & hashes[key]):
             continue
         inputs = {int(u.access.index): u.descriptor.resource for u in
                   pipe.GetReadOnlyResources(rd.ShaderStage.Compute, True)}
@@ -71,6 +74,17 @@ def dump_capture(path):
         if velocity is None or velocity.width <= 1:
             continue
         info = {"event": action.eventId, "inputs": {}}
+        for slot in range(len(refl.constantBlocks)):
+            if refl.constantBlocks[slot].fixedBindNumber != 1:
+                continue
+            desc = pipe.GetConstantBlock(rd.ShaderStage.Compute, slot, 0).descriptor
+            view = bytes(controller.GetBufferData(desc.resource, desc.byteOffset, refl.constantBlocks[slot].byteSize))
+            info["view"] = {
+                "temporal_aa_jitter": struct.unpack_from("<4f", view, 2016),
+                "clip_to_prev_clip": struct.unpack_from("<16f", view, 1952),
+                "view_size_and_inv_size": struct.unpack_from("<4f", view, 2080),
+                "view_rect_min": struct.unpack_from("<2f", view, 2064),
+            }
         for slot, rid in sorted(inputs.items()):
             tex = textures.get(int(rid))
             if tex is None or slot > 4:

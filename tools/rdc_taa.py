@@ -1,12 +1,18 @@
 """The TAA dispatches of one or more captures, with the values DLSS needs, to compare consecutive frames.
 
 Run inside RenderDoc's embedded Python (tools/rdc.sh tools/rdc_taa.py) with:
-  P3R_RDCS  ';'-separated .rdc captures
-  P3R_OUT   output text file
+  P3R_RDCS      ';'-separated .rdc captures
+  P3R_OUT       output text file
+  P3R_TAA_HASH  optional: ','-separated DXIL hashes (default: the TAAStandalone permutation of docs/recon.md)
+  P3R_FIND      optional: "1" matches by bindings instead of by hash, for a TAA permutation whose hash is not known
+                yet: every dispatch that reads a velocity-like texture (R16G16B16A16_UNORM, wider than 1 pixel) and
+                a D32S8 depth, printed with its hashes
 Finds every dispatch of the TAAStandalone compute shader (by its DXIL hash, see docs/recon.md) and prints its
 bindings and, from the constant buffers, bCameraCut, the plus weights, the view rect and the View uniform buffer's
 TemporalAAJitter, ViewSizeAndInvSize, BufferSizeAndInvSize, PreExposure and ClipToPrevClip. Offsets are UE 4.27's
-(the DXIL keeps the buffer layouts; docs/recon.md maps them).
+(the DXIL keeps the buffer layouts; docs/recon.md maps them). The $Globals offsets are those of the permutation in
+docs/recon.md; another permutation may lay $Globals out differently (rdc_inspect.py shows it), while View is the same
+struct everywhere.
 """
 import os
 import struct
@@ -14,7 +20,9 @@ import traceback
 
 import renderdoc as rd
 
-TAA_HASH = "203152694ac6f5d3b98e5464598f5669"
+TAA_HASHES = set(os.environ.get("P3R_TAA_HASH", "203152694ac6f5d3b98e5464598f5669").split(","))
+FIND = os.environ.get("P3R_FIND", "0") == "1"
+VIEW_SIZE = 5220  # bytes of UE 4.27's FViewUniformShaderParameters in this game
 OUT = open(os.environ["P3R_OUT"], "w", encoding="utf-8")
 
 
@@ -75,9 +83,17 @@ def dump_capture(path):
         key = int(refl.resourceId)
         if key not in hashes:
             hashes[key] = shader_hash(refl)
-        if TAA_HASH not in hashes[key]:
+        if FIND:
+            read = [textures.get(int(u.descriptor.resource)) for u in
+                    pipe.GetReadOnlyResources(rd.ShaderStage.Compute, True)]
+            names = [t.format.Name() for t in read if t is not None]
+            velocity = any(t is not None and t.width > 1 and t.format.Name() == "R16G16B16A16_UNORM" for t in read)
+            if not (velocity and any("D32S8" in n or "R32G8X24" in n for n in names)):
+                continue
+        elif not (TAA_HASHES & hashes[key]):
             continue
-        log("-- event %d dims=%s shader%d" % (action.eventId, tuple(action.dispatchDimension), key))
+        log("-- event %d dims=%s shader%d hashes %s" % (action.eventId, tuple(action.dispatchDimension), key,
+                                                         sorted(hashes[key])))
         for used in pipe.GetReadOnlyResources(rd.ShaderStage.Compute, True):
             rid = int(used.descriptor.resource)
             tex = textures.get(rid)
@@ -95,13 +111,20 @@ def dump_capture(path):
             blocks[refl.constantBlocks[slot].fixedBindNumber] = (
                 bytes(controller.GetBufferData(desc.resource, desc.byteOffset, size)),
                 "buf%d+%d" % (int(desc.resource), desc.byteOffset))
-        g, gwhere = blocks[0]
+        for slot in range(len(refl.constantBlocks)):
+            block = refl.constantBlocks[slot]
+            log("   b%d %s: %d bytes, %d variables" % (block.fixedBindNumber, block.name, block.byteSize,
+                                                     len(block.variables)))
+        if 1 not in blocks or len(blocks[1][0]) < VIEW_SIZE:
+            continue  # no View uniform buffer at b1: not a TAA pass
+        if 0 in blocks and len(blocks[0][0]) >= 400:
+            g, gwhere = blocks[0]
+            log("   $Globals %s: HistoryPreExposureCorrection=%.7g CurrentFrameWeight=%.7g bCameraCut=%d" % (
+                (gwhere,) + floats(g, 0, 2) + ints(g, 8, 1)))
+            log("   PlusWeights=%s" % fmt([floats(g, 160 + 16 * i, 1)[0] for i in range(5)]))
+            log("   ViewportUVToInputBufferUV=%s OutputViewportSize=%s OutputViewportRect=%s" % (
+                fmt(floats(g, 240, 4)), fmt(floats(g, 368, 4)), fmt(floats(g, 384, 4))))
         v, vwhere = blocks[1]
-        log("   $Globals %s: HistoryPreExposureCorrection=%.7g CurrentFrameWeight=%.7g bCameraCut=%d" % (
-            (gwhere,) + floats(g, 0, 2) + ints(g, 8, 1)))
-        log("   PlusWeights=%s" % fmt([floats(g, 160 + 16 * i, 1)[0] for i in range(5)]))
-        log("   ViewportUVToInputBufferUV=%s OutputViewportSize=%s OutputViewportRect=%s" % (
-            fmt(floats(g, 240, 4)), fmt(floats(g, 368, 4)), fmt(floats(g, 384, 4))))
         jitter = floats(v, 2016, 4)
         size = floats(v, 2080, 4)
         log("   View %s: TemporalAAJitter=%s -> pixels cur (%.4f, %.4f) prev (%.4f, %.4f)" % (
