@@ -1282,9 +1282,15 @@ bool KeyPressed(int vk) {
 void ApplyEngineVariables() {
   const bool dlss = g_config.enabled && g_dlss_available;
   // The jitter phases. The game's own changes of the variable land in [0] first, so [0] keeps its value; the jitter
-  // reads [1].
+  // reads [1]. Below 100% the upsampling path multiplies them by 1 / scale^2, and this game keeps the sample index in
+  // a signed byte: past 128 phases it turns negative, Halton gives 0 and the jitter sits at the pixel's corner
+  // (-0.5, -0.5) for about 127 frames of every 256 (seen at Ultra Performance: 16 x 9 = 144 phases; the image comes
+  // and goes). So the product stays at 127 or less (Ultra Performance 14 x 9 = 126, above NVIDIA's 72).
   if (int32_t* const samples = g_taa_samples.load()) {
-    const int32_t want = dlss && g_config.jitter_phases > 0 ? g_config.jitter_phases : samples[0];
+    int32_t want = dlss && g_config.jitter_phases > 0 ? g_config.jitter_phases : samples[0];
+    const float render_scale = RenderScale();
+    if (dlss && g_config.upsampling_path && g_taa_upsampling.load() != nullptr && render_scale < 1.0f)
+      want = (std::min)(want, (std::max)(1, static_cast<int32_t>(127.0f * render_scale * render_scale)));
     if (samples[1] != want) samples[1] = want;
   }
   // The temporal upsampling path and its uniform Halton jitter. Both copies are set, as which thread reads the

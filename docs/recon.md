@@ -204,6 +204,12 @@ add-on's development setting `RenderScale` (3f8b0ed) set `r.ScreenPercentage` 67
   render size (x: -4.858e-5 x 2573 / 2 = -0.0625 px). `MaterialTextureMipBias` +2292 is -1.5777 = log2(0.67005) - 1:
   with `r.ViewTextureMipBias.Offset` at -1 (`MipBias`) the engine applies NVIDIA's formula by itself.
 
+- The jitter's phase count is `r.TemporalAASamples` times 1 / scale^2 on this path, and past 128 the sequence
+  breaks: at Ultra Performance (16 x 9 = 144 phases) 5 of 9 logged frames had a jitter of exactly (-0.5, -0.5), the
+  others Halton points 32, 68 and 104, and the image came and went (good for about half a second, then worse, then
+  good again). That fits a sample index kept in a signed byte: from 128 on it is negative, Halton(n <= 0) is 0, and
+  the jitter sits at the pixel's corner for about 127 frames of every 256. The add-on keeps the product at 127 or less.
+
 ### The minimap flash under RenoDX (2026-11-03)
 
 RenoDX's known P3R issue: a bright hard-edged shape over the minimap while the HUD slides in after unpausing.
