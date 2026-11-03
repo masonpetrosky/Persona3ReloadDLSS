@@ -64,6 +64,10 @@ constexpr TaaPermutation kTaaPermutations[] = {
     {{0x20, 0x31, 0x52, 0x69, 0x4a, 0xc6, 0xf5, 0xd3, 0xb9, 0x8e, 0x54, 0x64, 0x59, 0x8f, 0x56, 0x69}, "the game's TAA"},
     {{0x97, 0x9c, 0x50, 0xe3, 0x4b, 0x73, 0x23, 0xab, 0x38, 0xa4, 0x0f, 0x49, 0x66, 0x67, 0xbf, 0xfd},
      "the engine's temporal upsampling"},
+    // The upsampling permutation for a render scale below 100% (logged at 67%: docs/recon.md); stock 4.27 picks the
+    // permutation by the screen percentage's range.
+    {{0xa8, 0x2d, 0x5a, 0xd9, 0x88, 0xf3, 0x4a, 0xe2, 0x5a, 0x19, 0x1b, 0x7f, 0x4c, 0xf3, 0x47, 0x8c},
+     "the engine's temporal upsampling below 100%"},
 };
 constexpr int kNotTaa = -1;
 
@@ -72,6 +76,7 @@ constexpr uint32_t kEyeAdaptationSrv = 0;  // 1x1 R32G32B32A32_FLOAT; x = the ex
 constexpr uint32_t kSceneColorSrv = 1;     // InputSceneColor, linear HDR
 constexpr uint32_t kDepthSrv = 2;          // the scene depth (its depth plane), reverse Z
 constexpr uint32_t kVelocitySrv = 3;       // GBufferVelocityTexture; a 1x1 dummy in the planar reflection's TAA
+constexpr uint32_t kHistorySrv = 5;        // HistoryBuffer[0], at the output size
 constexpr uint32_t kOutputUav = 0;         // the new history, which is the pass's output
 constexpr uint32_t kGlobalsCbv = 0;        // $Globals, a root constant buffer
 constexpr uint32_t kViewCbv = 1;           // View (FViewUniformShaderParameters), a root constant buffer
@@ -139,15 +144,33 @@ struct Config {
   // rhi.SyncInterval (VSync on every other refresh: 120 on a 240 Hz screen) and t.MaxFPS; with a cap the add-on
   // presents on every refresh and caps through Reflex's sleep (or t.MaxFPS without Reflex).
   float frame_rate_cap = 0.0f;
-  // Development (stage 3, upscaling): while DLSS is on and the upsampling path runs, the engine renders at this scale
-  // (r.ScreenPercentage = 100 x scale); 0 leaves it alone. DLSS does not upscale yet, so the engine's own upsampling
-  // TAA runs then, and every TAA-like pass is described in the log (LogTaaPass). Read at load.
+  // DLSS's quality mode, the render scale while DLSS runs (r.ScreenPercentage, on the upsampling path): kModes.
+  int mode = 0;
+  // Development: a render scale of its own in place of the mode's (0: the mode's), and the log of TAA-like passes
+  // (LogTaaPass). Both read at load.
   float render_scale = 0.0f;
+  bool log_taa_passes = false;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
 };
 
 Config g_config;
+
+// DLSS's quality modes as render scales (NVIDIA's ratios).
+struct QualityMode {
+  const char* name;
+  float scale;
+};
+constexpr QualityMode kModes[] = {
+    {"DLAA (100%)", 1.0f},          {"Quality (67%)", 2.0f / 3.0f},          {"Balanced (58%)", 0.58f},
+    {"Performance (50%)", 0.5f}, {"Ultra Performance (33%)", 1.0f / 3.0f},
+};
+constexpr int kModeCount = static_cast<int>(std::size(kModes));
+
+// The render scale while DLSS runs: the development override, else the mode's.
+float RenderScale() {
+  return g_config.render_scale > 0.0f ? g_config.render_scale : kModes[g_config.mode].scale;
+}
 fs::path g_addon_dir;  // the game's Binaries\Win64
 fs::path g_data_dir;   // Persona3ReloadDLSS in it: nvngx_dlss.dll and NGX's logs
 fs::path g_ini_path;
@@ -238,6 +261,7 @@ std::atomic<uint64_t> g_taa_dispatches{0};  // the main view's TAA dispatches se
 std::atomic<uint64_t> g_dlss_frames{0};
 std::atomic<uint64_t> g_last_dlss_frame{0};  // g_frame when DLSS last ran
 std::atomic<uint32_t> g_out_width{0}, g_out_height{0};
+std::atomic<uint32_t> g_render_width{0}, g_render_height{0};  // DLSS's input size last time it ran
 std::atomic<float> g_last_jitter_x{0.0f}, g_last_jitter_y{0.0f};
 
 std::shared_mutex g_taa_mutex;
@@ -318,8 +342,10 @@ void LoadConfig() {
   g_config.reflex = ReadInt(L"Reflex", 1) != 0;
   g_config.frame_rate_cap = ReadFloat(L"FrameRateCap", 0.0f);
   if (g_config.frame_rate_cap != 0.0f) g_config.frame_rate_cap = std::clamp(g_config.frame_rate_cap, 30.0f, 1000.0f);
+  g_config.mode = std::clamp(ReadInt(L"Mode", 0), 0, kModeCount - 1);
   g_config.render_scale = ReadFloat(L"RenderScale", 0.0f);
   if (g_config.render_scale != 0.0f) g_config.render_scale = std::clamp(g_config.render_scale, 0.33f, 1.0f);
+  g_config.log_taa_passes = ReadInt(L"LogTaaPasses", 0) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -333,6 +359,7 @@ void SaveConfig() {
   WriteFloat(L"MipBias", g_config.mip_bias);
   WriteInt(L"Reflex", g_config.reflex);
   WriteFloat(L"FrameRateCap", g_config.frame_rate_cap);
+  WriteInt(L"Mode", g_config.mode);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
 }
@@ -801,9 +828,13 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   const resource eye = bound(RegisterKind::kShaderResource, kEyeAdaptationSrv);
   const resource color = bound(RegisterKind::kShaderResource, kSceneColorSrv);
   const resource depth = bound(RegisterKind::kShaderResource, kDepthSrv);
+  const resource history = bound(RegisterKind::kShaderResource, kHistorySrv);
   const resource output = bound(RegisterKind::kUnorderedAccess, kOutputUav);
   const resource_desc od = output != 0 ? dev->get_resource_desc(output) : resource_desc();
-  const uint32_t width = od.texture.width, height = od.texture.height;
+  const uint32_t width = od.texture.width, height = od.texture.height;  // the output size
+  // The inputs' size: the render view sits in their top-left corner (the scene textures can be a little larger).
+  const resource_desc cd = color != 0 ? dev->get_resource_desc(color) : resource_desc();
+  const uint32_t in_width = cd.texture.width, in_height = cd.texture.height;
   const format depth_format = depth != 0 ? DepthViewFormat(dev->get_resource_desc(depth).texture.format) : format::unknown;
   g_out_width = width;
   g_out_height = height;
@@ -811,21 +842,29 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   TaaConstants c;
   std::string why;
   bool valid = ReadTaaConstants(dev, *descriptors, data, tables->first, &c, &why);
-  const float jitter_x = c.jitter[0] * 0.5f * static_cast<float>(width);  // render pixels, x right and y down
-  const float jitter_y = -c.jitter[1] * 0.5f * static_cast<float>(height);
+  // The render size, and the jitter in render pixels, x right and y down (TemporalAAJitter is in clip units of the
+  // render view).
+  const auto render_width = static_cast<uint32_t>(c.view_size[0]), render_height = static_cast<uint32_t>(c.view_size[1]);
+  const float jitter_x = c.jitter[0] * 0.5f * c.view_size[0];
+  const float jitter_y = -c.jitter[1] * 0.5f * c.view_size[1];
   if (valid && !(IsTexture(dev, output, width, height, format::r16g16b16a16_typeless) &&
-                 IsTexture(dev, color, width, height, format::r16g16b16a16_typeless) &&
-                 IsTexture(dev, velocity, width, height, format::r16g16b16a16_typeless) &&
-                 IsTexture(dev, depth, width, height, format::unknown) && depth_format != format::unknown &&
+                 IsTexture(dev, history, width, height, format::r16g16b16a16_typeless) &&
+                 IsTexture(dev, color, in_width, in_height, format::r16g16b16a16_typeless) &&
+                 IsTexture(dev, velocity, in_width, in_height, format::r16g16b16a16_typeless) &&
+                 IsTexture(dev, depth, in_width, in_height, format::unknown) && depth_format != format::unknown &&
                  IsTexture(dev, eye, 1, 1, format::r32g32b32a32_typeless))) {
     valid = false;
     why = "unexpected textures";
   }
-  if (valid && !(c.view_size[0] == static_cast<float>(width) && c.view_size[1] == static_cast<float>(height) &&
-                 c.view_rect_min[0] == 0.0f && c.view_rect_min[1] == 0.0f)) {
+  if (valid && !(c.view_rect_min[0] == 0.0f && c.view_rect_min[1] == 0.0f && render_width >= 64 &&
+                 render_height >= 64 && render_width <= in_width && render_height <= in_height &&
+                 render_width <= width && render_height <= height &&
+                 static_cast<float>(render_width) == c.view_size[0] &&
+                 static_cast<float>(render_height) == c.view_size[1])) {
     valid = false;
-    why = "the view does not fill the output (a render scale below 100%?)";
+    why = "the render view is not in the inputs' top-left corner or larger than the output";
   }
+  const float scale = valid ? static_cast<float>(render_width) / static_cast<float>(width) : 1.0f;
   if (valid && !(std::fabs(jitter_x) <= 1.0f && std::fabs(jitter_y) <= 1.0f && c.pre_exposure > 0.0f &&
                  std::isfinite(c.pre_exposure))) {
     valid = false;
@@ -842,18 +881,19 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   if (!g_config.enabled || !valid || !g_nvidia_ready) return false;
 
   std::lock_guard lock(g_dlss_mutex);
-  if (!g_dlss.available() || g_recreate.load() || !EnsurePass(dev, width, height)) return false;
+  if (!g_dlss.available() || g_recreate.load() || !EnsurePass(dev, render_width, render_height)) return false;
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   const bool game_exposure = g_config.game_exposure;
   if (g_dlss.has_feature() &&
       (g_dlss.feature_width() != width || g_dlss.feature_height() != height ||
+       !g_dlss.accepts(render_width, render_height) || std::fabs(g_dlss.feature_scale() - scale) > 0.01f ||
        g_dlss.feature_preset() != g_config.preset || g_dlss.feature_auto_exposure() == game_exposure)) {
     g_recreate = true;  // the old feature may still be in flight; it is released at the present once the GPU is idle
     return false;
   }
   if (!g_dlss.has_feature()) {
-    const bool created =
-        g_dlss.Create(native, width, height, width, height, 1.0f, g_config.preset, true, !game_exposure);
+    const bool created = g_dlss.Create(native, width, height, render_width, render_height, scale, g_config.preset,
+                                       true, !game_exposure);
     RestoreState(cmd_list, data);
     if (created) {
       Log(reshade::log::level::info, "Created the DLSS feature: " + g_dlss.status());
@@ -883,7 +923,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
                              descriptor_table_update{{}, 0, 0, 3, descriptor_type::texture_shader_resource_view, srvs});
   cmd_list->push_descriptors(shader_stage::compute, g_mv_layout, 2,
                              descriptor_table_update{{}, 0, 0, 2, descriptor_type::texture_unordered_access_view, uavs});
-  cmd_list->dispatch((width + 7) / 8, (height + 7) / 8, 1);
+  cmd_list->dispatch((render_width + 7) / 8, (render_height + 7) / 8, 1);
   cmd_list->barrier(2, ours, writable, readable);
 
   const uint64_t frame = g_frame.load();
@@ -893,8 +933,8 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   in.motion = reinterpret_cast<ID3D12Resource*>(g_motion.handle);
   in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
   in.exposure = game_exposure ? reinterpret_cast<ID3D12Resource*>(g_exposure.handle) : nullptr;
-  in.width = width;
-  in.height = height;
+  in.width = render_width;
+  in.height = render_height;
   in.jitter_x = jitter_x;
   in.jitter_y = jitter_y;
   in.pre_exposure = c.pre_exposure;
@@ -916,6 +956,8 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     return false;
   }
   g_last_dlss_frame = frame;
+  g_render_width = render_width;
+  g_render_height = render_height;
   g_last_jitter_x = jitter_x;
   g_last_jitter_y = jitter_y;
   const uint64_t frames = ++g_dlss_frames;
@@ -923,11 +965,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     const int32_t* const samples = g_taa_samples.load();
     char text[256];
     std::snprintf(text, sizeof(text),
-                  "DLSS frame %llu (TAA dispatch %llu): %ux%u, jitter %+.3f %+.3f px, %d jitter phases, pre-exposure "
-                  "%.3g, camera cut %d, reset %d, failures %llu",
-                  static_cast<unsigned long long>(frames), static_cast<unsigned long long>(dispatch), width, height,
-                  jitter_x, jitter_y, samples != nullptr ? samples[1] : -1, c.pre_exposure, c.camera_cut ? 1 : 0,
-                  in.reset ? 1 : 0, static_cast<unsigned long long>(g_failures.load()));
+                  "DLSS frame %llu (TAA dispatch %llu): %ux%u to %ux%u, jitter %+.3f %+.3f px, %d jitter phases, "
+                  "pre-exposure %.3g, camera cut %d, reset %d, failures %llu",
+                  static_cast<unsigned long long>(frames), static_cast<unsigned long long>(dispatch), render_width,
+                  render_height, width, height, jitter_x, jitter_y, samples != nullptr ? samples[1] : -1,
+                  c.pre_exposure, c.camera_cut ? 1 : 0, in.reset ? 1 : 0,
+                  static_cast<unsigned long long>(g_failures.load()));
     Log(reshade::log::level::info, text);
   }
   return true;
@@ -1124,7 +1167,7 @@ void StartNvidia(ID3D12Device* device) {
   }
   if (max_fps != nullptr) g_max_fps.Found(max_fps);
   if (sync != nullptr) g_sync_interval.Found(sync);
-  if (g_config.render_scale > 0.0f) {
+  {
     float* percent = p3rdlss::FindFloatConsoleVariable(L"r.ScreenPercentage", &g_screen_percentage.detail);
     const auto is_percent = [](float v) { return std::isfinite(v) && v >= 1.0f && v <= 400.0f; };
     if (percent != nullptr && !(is_percent(percent[0]) && is_percent(percent[1]))) {
@@ -1134,11 +1177,12 @@ void StartNvidia(ID3D12Device* device) {
     if (percent != nullptr) {
       g_screen_percentage.Found(percent);
       char text[160];
-      std::snprintf(text, sizeof(text), "r.ScreenPercentage: the game's value is %.0f; %.0f while DLSS runs (RenderScale).",
-                    percent[0], g_config.render_scale * 100.0f);
+      std::snprintf(text, sizeof(text), "r.ScreenPercentage: the game's value is %.0f; %.1f while DLSS runs.",
+                    percent[0], RenderScale() * 100.0f);
       Log(reshade::log::level::info, text);
     } else {
-      Log(reshade::log::level::warning, "r.ScreenPercentage not found (" + g_screen_percentage.detail + ").");
+      Log(reshade::log::level::warning, "r.ScreenPercentage not found (" + g_screen_percentage.detail +
+                                            "); DLSS runs as DLAA only.");
     }
   }
   if (g_reflex.Init(device)) {
@@ -1279,10 +1323,10 @@ void ApplyEngineVariables() {
     Log(reshade::log::level::info,
         "The game set t.MaxFPS to " + std::to_string(static_cast<int>(g_max_fps.game[0])) + ".");
   if (g_reflex_ready) g_reflex.Configure(reflex_on, reflex_caps ? static_cast<uint32_t>(1e6f / cap) : 0u);
-  // Development: the render scale (r.ScreenPercentage), on the upsampling path only.
-  const bool scaling = dlss && g_config.upsampling_path && g_taa_upsampling.load() != nullptr &&
-                       g_config.render_scale > 0.0f;
-  if (g_screen_percentage.Apply(scaling, g_config.render_scale * 100.0f))
+  // The quality mode's render scale (r.ScreenPercentage), on the upsampling path only: the other path cannot upscale.
+  const float render_scale = RenderScale();
+  const bool scaling = dlss && g_config.upsampling_path && g_taa_upsampling.load() != nullptr && render_scale < 1.0f;
+  if (g_screen_percentage.Apply(scaling, render_scale * 100.0f))
     Log(reshade::log::level::info,
         "The game set r.ScreenPercentage to " + std::to_string(static_cast<int>(g_screen_percentage.game[0])) + ".");
 }
@@ -1336,13 +1380,23 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
 
 void OnOverlay(effect_runtime*) {
   bool enabled = g_config.enabled;
-  if (ImGui::Checkbox("Use DLSS (DLAA) instead of the game's TAA", &enabled)) {
+  if (ImGui::Checkbox("Use DLSS instead of the game's TAA", &enabled)) {
     SetDlssEnabled(enabled);
     SaveConfig();
   }
   const std::string toggle = "Toggle in game with " + KeyName(g_config.toggle_key) +
-                             " (ToggleKey in Persona3ReloadDLSS.ini).";
+                             " (ToggleKey in Persona3ReloadDLSS.ini). Off renders at the game's own resolution.";
   ImGui::SetItemTooltip("%s", toggle.c_str());
+
+  const char* mode_names[kModeCount];
+  for (int i = 0; i < kModeCount; ++i) mode_names[i] = kModes[i].name;
+  ImGui::BeginDisabled(!g_config.upsampling_path || g_config.render_scale > 0.0f);
+  if (ImGui::Combo("Mode", &g_config.mode, mode_names, kModeCount)) SaveConfig();
+  ImGui::EndDisabled();
+  ImGui::SetItemTooltip("The resolution the game renders at while DLSS runs; DLSS turns it into the output "
+                        "resolution. DLAA renders at full resolution for the best image; the others trade image "
+                        "quality for frame rate. Needs the Halton jitter path below; RenderScale in the ini "
+                        "overrides it.");
 
   const char* const preset_names[] = {"Default (K)", "E (older CNN model, lightest)", "J", "K", "L", "M"};
   static const int kPresetValues[] = {0, 5, 10, 11, 12, 13};
@@ -1419,15 +1473,11 @@ void OnOverlay(effect_runtime*) {
     if (permutation != kNotTaa)
       ImGui::Text("DLSS last replaced the TAA pass of %s.", kTaaPermutations[permutation].name);
     ImGui::TextWrapped("Reflex: %s", g_reflex_ready ? g_reflex.SleepStatus().c_str() : g_reflex.status().c_str());
-    if (g_diagnostics) {
-      if (const float* const percent = g_screen_percentage.values.load())
-        ImGui::TextWrapped("Development: render scale %.0f%% (RenderScale %.2f; the game's %.0f%%). DLSS does not "
-                           "upscale yet: the engine's own upsampling runs, and TAA-like passes go to the log.",
-                           percent[0], g_config.render_scale, g_screen_percentage.game[0]);
-      else
-        ImGui::TextWrapped("Development: RenderScale set, but r.ScreenPercentage not found (%s).",
-                           g_screen_percentage.detail.c_str());
-    }
+    if (const float* const percent = g_screen_percentage.values.load())
+      ImGui::Text("Render scale: %.1f%% (the game's %.0f%%)", percent[0], g_screen_percentage.game[0]);
+    else
+      ImGui::TextWrapped("Render scale: the game's (r.ScreenPercentage not found: %s)",
+                         g_screen_percentage.detail.c_str());
     const float* const max_fps = g_max_fps.values.load();
     const int32_t* const sync = g_sync_interval.values.load();
     if (max_fps != nullptr && sync != nullptr)
@@ -1439,8 +1489,8 @@ void OnOverlay(effect_runtime*) {
   }
   const uint64_t last = g_last_dlss_frame.load();
   if (g_dlss_frames.load() != 0 && last + 2 >= g_frame.load())
-    ImGui::Text("Running at %ux%u, jitter %+.2f %+.2f px", g_out_width.load(), g_out_height.load(),
-                g_last_jitter_x.load(), g_last_jitter_y.load());
+    ImGui::Text("Running: %ux%u to %ux%u, jitter %+.2f %+.2f px", g_render_width.load(), g_render_height.load(),
+                g_out_width.load(), g_out_height.load(), g_last_jitter_x.load(), g_last_jitter_y.load());
   else if (g_config.enabled)
     ImGui::TextUnformatted("Not running this frame (the game's TAA runs).");
   if (g_failures.load() != 0) ImGui::Text("Failed evaluations: %llu", static_cast<unsigned long long>(g_failures.load()));
@@ -1453,18 +1503,19 @@ void Initialize(HMODULE module) {
   g_data_dir = g_addon_dir / L"Persona3ReloadDLSS";
   g_ini_path = g_addon_dir / L"Persona3ReloadDLSS.ini";
   LoadConfig();
-  g_diagnostics = g_config.render_scale > 0.0f;
-  if (g_diagnostics) {
-    char scale[160];
-    std::snprintf(scale, sizeof(scale), "Development: render scale %.2f while DLSS runs on the upsampling path; "
-                  "TAA-like passes are logged.", g_config.render_scale);
+  g_diagnostics = g_config.log_taa_passes;
+  if (g_diagnostics) Log(reshade::log::level::info, "Development: TAA-like passes are logged (LogTaaPasses).");
+  if (g_config.render_scale > 0.0f) {
+    char scale[128];
+    std::snprintf(scale, sizeof(scale), "Development: render scale %.2f in place of the mode's (RenderScale).",
+                  g_config.render_scale);
     Log(reshade::log::level::info, scale);
   }
-  char text[224];
+  char text[256];
   std::snprintf(text, sizeof(text),
-                "Loaded. DLSS %s; toggle key %s; %d jitter phases; upsampling path %s, mip bias %.2f; preset %d.",
-                g_config.enabled ? "on" : "off", KeyName(g_config.toggle_key).c_str(), g_config.jitter_phases,
-                g_config.upsampling_path ? "on" : "off", g_config.mip_bias, g_config.preset);
+                "Loaded. DLSS %s, %s; toggle key %s; %d jitter phases; upsampling path %s, mip bias %.2f; preset %d.",
+                g_config.enabled ? "on" : "off", kModes[g_config.mode].name, KeyName(g_config.toggle_key).c_str(),
+                g_config.jitter_phases, g_config.upsampling_path ? "on" : "off", g_config.mip_bias, g_config.preset);
   Log(reshade::log::level::info, text);
 }
 

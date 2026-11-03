@@ -54,8 +54,10 @@ Copy-Item $source $dll -Force
 if (-not (Test-Path $ini)) {
   @'
 [Persona3ReloadDLSS]
-; 1: DLSS (DLAA) replaces the game's TAA; 0: the game's TAA. ToggleKey switches in game (120 = F9).
+; 1: DLSS replaces the game's TAA; 0: the game's TAA. ToggleKey switches in game (120 = F9).
 Enabled=1
+; 0 DLAA (100%), 1 Quality (67%), 2 Balanced (58%), 3 Performance (50%), 4 Ultra Performance (33%).
+Mode=0
 ToggleKey=120
 ; 0: NVIDIA's default (K); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M.
 Preset=0

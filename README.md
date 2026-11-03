@@ -3,7 +3,7 @@
 A ReShade add-on that puts NVIDIA DLSS in place of Persona 3 Reload's TAA: DLAA at native resolution first, then
 upscaling. Free and open source (MIT).
 
-Status: stage 2, DLAA: runs in game since 2026-10-22; upscaling (stage 3) is next. See [docs/plan.md](docs/plan.md)
+Status: DLAA runs in game since 2026-10-22; upscaling (stage 3, the quality modes) built 2026-11-03, being tested. See [docs/plan.md](docs/plan.md)
 and [docs/recon.md](docs/recon.md).
 
 ## How it works
@@ -42,6 +42,7 @@ what the add-on is doing. The add-on logs to `ReShade.log`, prefixed `[P3RDLSS]`
 | Key | Default | |
 | --- | --- | --- |
 | `Enabled` | 1 | DLSS in place of the game's TAA |
+| `Mode` | 0 | 0 DLAA (100%), 1 Quality (67%), 2 Balanced (58%), 3 Performance (50%), 4 Ultra Performance (33%): the render scale while DLSS runs (`r.ScreenPercentage`, on the upsampling path); DLSS upscales to the output |
 | `ToggleKey` | 120 (F9) | switches between DLSS and the game's TAA in game (not while Alt, Ctrl or Shift is held) |
 | `Preset` | 0 | 0 = NVIDIA's default (K); 5 = E, 10 = J, 11 = K, 12 = L, 13 = M |
 | `JitterPhases` | 16 | the camera jitter's phases while DLSS runs; 0 keeps the game's |
