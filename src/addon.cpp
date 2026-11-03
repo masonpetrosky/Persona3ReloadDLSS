@@ -18,6 +18,7 @@
 #include <locale.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -137,6 +138,10 @@ struct Config {
   // rhi.SyncInterval (VSync on every other refresh: 120 on a 240 Hz screen) and t.MaxFPS; with a cap the add-on
   // presents on every refresh and caps through Reflex's sleep (or t.MaxFPS without Reflex).
   float frame_rate_cap = 0.0f;
+  // Development (stage 3, upscaling): while DLSS is on and the upsampling path runs, the engine renders at this scale
+  // (r.ScreenPercentage = 100 x scale); 0 leaves it alone. DLSS does not upscale yet, so the engine's own upsampling
+  // TAA runs then, and every TAA-like pass is described in the log (LogTaaPass). Read at load.
+  float render_scale = 0.0f;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
 };
@@ -216,6 +221,7 @@ struct EngineVariable {
 };
 EngineVariable<float> g_max_fps;       // t.MaxFPS: the engine's frame rate limit, 0 for none
 EngineVariable<int32_t> g_sync_interval;  // rhi.SyncInterval: present on every n-th refresh while VSync is on
+EngineVariable<float> g_screen_percentage;  // r.ScreenPercentage: the render scale in percent (development, stage 3)
 
 p3rdlss::Reflex g_reflex;  // started by the NVIDIA thread; g_reflex_ready once it has run
 std::atomic<bool> g_reflex_ready{false};
@@ -235,6 +241,12 @@ std::atomic<float> g_last_jitter_x{0.0f}, g_last_jitter_y{0.0f};
 
 std::shared_mutex g_taa_mutex;
 std::unordered_map<uint64_t, int> g_taa_pipelines;  // pipeline handle -> TAA permutation
+// Development (RenderScale > 0 at load): the digest of every compute pipeline, to name TAA-like passes in the log.
+using Digest = std::array<uint8_t, 16>;
+bool g_diagnostics = false;
+std::unordered_map<uint64_t, Digest> g_compute_digests;
+std::mutex g_logged_passes_mutex;
+std::unordered_set<std::string> g_logged_passes;  // the TAA-like passes logged already (digest and sizes)
 
 // The motion vector pass and its textures, under g_dlss_mutex.
 resource g_motion = {0};  // R16G16_FLOAT, render pixels from this frame's position to the previous one
@@ -304,6 +316,8 @@ void LoadConfig() {
   g_config.reflex = ReadInt(L"Reflex", 1) != 0;
   g_config.frame_rate_cap = ReadFloat(L"FrameRateCap", 0.0f);
   if (g_config.frame_rate_cap != 0.0f) g_config.frame_rate_cap = std::clamp(g_config.frame_rate_cap, 30.0f, 1000.0f);
+  g_config.render_scale = ReadFloat(L"RenderScale", 0.0f);
+  if (g_config.render_scale != 0.0f) g_config.render_scale = std::clamp(g_config.render_scale, 0.33f, 1.0f);
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -338,11 +352,11 @@ std::string KeyName(int vk) {
 // --- Pass detection --------------------------------------------------------------------------------------------
 
 // A DXIL container: "DXBC", its digest, version, size, part count and part offsets; each part starts with its
-// four-character code and size. The HASH part holds flags and the shader's digest. Returns the TAA permutation.
-int FindTaaPermutation(const shader_desc* cs) {
-  if (cs == nullptr || cs->code == nullptr || cs->code_size < 32) return kNotTaa;
+// four-character code and size. The HASH part holds flags and the shader's digest, which goes to `out`.
+bool DxilDigest(const shader_desc* cs, Digest* out) {
+  if (cs == nullptr || cs->code == nullptr || cs->code_size < 32) return false;
   const auto* const code = static_cast<const uint8_t*>(cs->code);
-  if (std::memcmp(code, "DXBC", 4) != 0) return kNotTaa;
+  if (std::memcmp(code, "DXBC", 4) != 0) return false;
   uint32_t parts = 0;
   std::memcpy(&parts, code + 28, 4);
   for (uint32_t i = 0; i < parts && 32 + 4 * (size_t{i} + 1) <= cs->code_size; ++i) {
@@ -350,17 +364,35 @@ int FindTaaPermutation(const shader_desc* cs) {
     std::memcpy(&offset, code + 32 + 4 * i, 4);
     if (offset > cs->code_size || cs->code_size - offset < 28) continue;
     if (std::memcmp(code + offset, "HASH", 4) != 0) continue;
-    for (int p = 0; p < static_cast<int>(std::size(kTaaPermutations)); ++p)
-      if (std::memcmp(code + offset + 12, kTaaPermutations[p].hash, 16) == 0) return p;
-    return kNotTaa;
+    std::memcpy(out->data(), code + offset + 12, 16);
+    return true;
   }
+  return false;
+}
+
+// The TAA permutation of a compute shader, by its digest.
+int FindTaaPermutation(const Digest& digest) {
+  for (int p = 0; p < static_cast<int>(std::size(kTaaPermutations)); ++p)
+    if (std::memcmp(digest.data(), kTaaPermutations[p].hash, 16) == 0) return p;
   return kNotTaa;
+}
+
+std::string Hex(const Digest& digest) {
+  char text[33];
+  for (int i = 0; i < 16; ++i) std::snprintf(text + 2 * i, 3, "%02x", digest[i]);
+  return text;
 }
 
 void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
   for (uint32_t i = 0; i < count; ++i) {
     if (subobjects[i].type != pipeline_subobject_type::compute_shader) continue;
-    const int permutation = FindTaaPermutation(static_cast<const shader_desc*>(subobjects[i].data));
+    Digest digest = {};
+    if (!DxilDigest(static_cast<const shader_desc*>(subobjects[i].data), &digest)) return;
+    if (g_diagnostics) {
+      std::unique_lock lock(g_taa_mutex);
+      g_compute_digests[p.handle] = digest;
+    }
+    const int permutation = FindTaaPermutation(digest);
     if (permutation == kNotTaa) return;
     size_t total = 0;
     {
@@ -379,6 +411,7 @@ void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_sub
 void OnDestroyPipeline(device*, pipeline p) {
   std::unique_lock lock(g_taa_mutex);
   g_taa_pipelines.erase(p.handle);
+  g_compute_digests.erase(p.handle);
 }
 
 void OnInitCommandList(command_list* cmd_list) { cmd_list->create_private_data<CmdData>(); }
@@ -842,9 +875,112 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   return true;
 }
 
-bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
+// --- Development: TAA-like passes in the log (RenderScale > 0) -------------------------------------------------
+
+// The root constant buffers bound at b0 and b1 for the compute root signature `layout`, as ReadTaaConstants finds them.
+bool RootConstantBuffers(const p3rdlss::Descriptors& descriptors, const CmdData& data, pipeline_layout layout,
+                         buffer_range* b0, buffer_range* b1) {
+  *b0 = {};
+  *b1 = {};
+  const std::vector<p3rdlss::Descriptors::ParamInfo> params = descriptors.Params(layout);
+  for (uint32_t i = 0; i < params.size(); ++i) {
+    const p3rdlss::Descriptors::ParamInfo& p = params[i];
+    if ((p.type != pipeline_layout_param_type::push_descriptors &&
+         p.type != pipeline_layout_param_type::push_descriptors_with_ranges &&
+         p.type != pipeline_layout_param_type::push_descriptors_with_ranges_and_flags) ||
+        p.ranges.size() != 1 || p.ranges[0].type != descriptor_type::constant_buffer ||
+        p.ranges[0].dx_register_space != 0 || data.cbv_layout != layout || i >= data.cbvs.size())
+      continue;
+    if (p.ranges[0].dx_register_index == kGlobalsCbv) *b0 = data.cbvs[i];
+    if (p.ranges[0].dx_register_index == kViewCbv) *b1 = data.cbvs[i];
+  }
+  return b0->buffer != 0 && b1->buffer != 0;
+}
+
+// `count` 32-bit values of a constant buffer from byte `first` on, four to a row: floats where they look like floats,
+// otherwise the integer ("u" + value).
+std::string ConstantRows(device* dev, const buffer_range& range, uint32_t first, uint32_t count) {
+  std::vector<uint32_t> values(count);
+  if (!ReadBuffer(dev, range, first, count * 4, values.data())) return " (not readable)";
+  std::string out;
+  char text[48];
+  for (uint32_t i = 0; i < count; ++i) {
+    if (i % 4 == 0) {
+      std::snprintf(text, sizeof(text), "%s+%u:", i == 0 ? "" : " |", first + 4 * i);
+      out += text;
+    }
+    float f;
+    std::memcpy(&f, &values[i], 4);
+    if (values[i] == 0 || (std::isfinite(f) && std::fabs(f) >= 1e-6f && std::fabs(f) < 1e8f))
+      std::snprintf(text, sizeof(text), " %.7g", f);
+    else
+      std::snprintf(text, sizeof(text), " u%u", values[i]);
+    out += text;
+  }
+  return out;
+}
+
+// A TAA-like pass (the velocity and depth-stencil inputs of TAAStandalone) in the log, once per shader and input size:
+// its digest, dispatch size, inputs and output, and both constant buffers ($Globals whole, View around the values the
+// add-on reads), for a permutation the add-on does not know yet, such as the one for a render scale below 100%.
+void LogTaaPass(command_list* cmd_list, const CmdData& data, uint32_t gx, uint32_t gy, uint32_t gz) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<p3rdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return;
+  const Tables* const tables = ComputeTables(*state);
+  if (tables == nullptr || tables->first == 0) return;
+  const auto bound = [&](RegisterKind kind, uint32_t reg) {
+    return BoundResource(dev, *descriptors, *tables, kind, reg);
+  };
+  const resource velocity = bound(RegisterKind::kShaderResource, kVelocitySrv);
+  const resource depth = bound(RegisterKind::kShaderResource, kDepthSrv);
+  if (velocity == 0 || depth == 0) return;
+  const resource_desc vd = dev->get_resource_desc(velocity), dd = dev->get_resource_desc(depth);
+  if (vd.type != resource_type::texture_2d || vd.texture.width <= 1 ||
+      format_to_typeless(vd.texture.format) != format::r16g16b16a16_typeless ||
+      format_to_typeless(dd.texture.format) != format::r32_g8_typeless)
+    return;
+
+  Digest digest = {};
+  {
+    std::shared_lock lock(g_taa_mutex);
+    const auto it = g_compute_digests.find(data.current.handle);
+    if (it != g_compute_digests.end()) digest = it->second;
+  }
+  const resource color = bound(RegisterKind::kShaderResource, kSceneColorSrv);
+  const resource output = bound(RegisterKind::kUnorderedAccess, kOutputUav);
+  const std::string key = Hex(digest) + " " + Describe(dev, color) + " " + Describe(dev, output);
+  {
+    std::lock_guard lock(g_logged_passes_mutex);
+    if (g_logged_passes.size() >= 64 || !g_logged_passes.insert(key).second) return;
+  }
+  const int permutation = FindTaaPermutation(digest);
+  char text[200];
+  std::snprintf(text, sizeof(text), "TAA-like pass: shader %s (%s), dispatch %ux%ux%u.", Hex(digest).c_str(),
+                permutation != kNotTaa ? kTaaPermutations[permutation].name : "not a known permutation", gx, gy, gz);
+  Log(reshade::log::level::info, text);
+  std::string inputs;
+  for (uint32_t t = 0; t <= 5; ++t)
+    inputs += (t == 0 ? "  t" : ", t") + std::to_string(t) + " " + Describe(dev, bound(RegisterKind::kShaderResource, t));
+  Log(reshade::log::level::info, inputs + ", u0 " + Describe(dev, output));
+  buffer_range b0, b1;
+  if (!RootConstantBuffers(*descriptors, data, tables->first, &b0, &b1)) {
+    Log(reshade::log::level::info, "  (its root constant buffers b0 and b1 were not seen)");
+    return;
+  }
+  const resource_desc b0d = dev->get_resource_desc(b0.buffer);
+  const uint64_t b0_left = b0d.buffer.size > b0.offset ? b0d.buffer.size - b0.offset : 0;
+  const auto b0_values = static_cast<uint32_t>((std::min)(b0_left, uint64_t{512}) / 4);
+  Log(reshade::log::level::info, "  b0 $Globals" + ConstantRows(dev, b0, 0, b0_values));
+  Log(reshade::log::level::info, "  b1 View" + ConstantRows(dev, b1, kClipToPrevClip, (2320 - kClipToPrevClip) / 4));
+}
+
+bool OnDispatch(command_list* cmd_list, uint32_t gx, uint32_t gy, uint32_t gz) {
   auto* const data = cmd_list->get_private_data<CmdData>();
-  if (data == nullptr || data->taa == kNotTaa) return false;
+  if (data == nullptr) return false;
+  if (g_diagnostics) LogTaaPass(cmd_list, *data, gx, gy, gz);
+  if (data->taa == kNotTaa) return false;
   if (!ReplaceTaa(cmd_list, *data)) return false;
   if (g_last_permutation.exchange(data->taa) != data->taa)
     Log(reshade::log::level::info,
@@ -930,6 +1066,23 @@ void StartNvidia(ID3D12Device* device) {
   }
   if (max_fps != nullptr) g_max_fps.Found(max_fps);
   if (sync != nullptr) g_sync_interval.Found(sync);
+  if (g_config.render_scale > 0.0f) {
+    float* percent = p3rdlss::FindFloatConsoleVariable(L"r.ScreenPercentage", &g_screen_percentage.detail);
+    const auto is_percent = [](float v) { return std::isfinite(v) && v >= 1.0f && v <= 400.0f; };
+    if (percent != nullptr && !(is_percent(percent[0]) && is_percent(percent[1]))) {
+      g_screen_percentage.detail += ", but its values are no percentages";
+      percent = nullptr;
+    }
+    if (percent != nullptr) {
+      g_screen_percentage.Found(percent);
+      char text[160];
+      std::snprintf(text, sizeof(text), "r.ScreenPercentage: the game's value is %.0f; %.0f while DLSS runs (RenderScale).",
+                    percent[0], g_config.render_scale * 100.0f);
+      Log(reshade::log::level::info, text);
+    } else {
+      Log(reshade::log::level::warning, "r.ScreenPercentage not found (" + g_screen_percentage.detail + ").");
+    }
+  }
   if (g_reflex.Init(device)) {
     g_reflex_ready = true;
     Log(reshade::log::level::info, "Reflex is available.");
@@ -979,6 +1132,7 @@ void OnDestroyDevice(device* dev) {
   }
   g_max_fps.Restore();
   g_sync_interval.Restore();
+  g_screen_percentage.Restore();
   if (g_reflex_ready.exchange(false)) g_reflex.Configure(false, 0);
   if (float* const bias = g_mip_bias_offset.exchange(nullptr)) {
     bias[0] = g_mip_bias_game[0];
@@ -1067,6 +1221,12 @@ void ApplyEngineVariables() {
     Log(reshade::log::level::info,
         "The game set t.MaxFPS to " + std::to_string(static_cast<int>(g_max_fps.game[0])) + ".");
   if (g_reflex_ready) g_reflex.Configure(reflex_on, reflex_caps ? static_cast<uint32_t>(1e6f / cap) : 0u);
+  // Development: the render scale (r.ScreenPercentage), on the upsampling path only.
+  const bool scaling = dlss && g_config.upsampling_path && g_taa_upsampling.load() != nullptr &&
+                       g_config.render_scale > 0.0f;
+  if (g_screen_percentage.Apply(scaling, g_config.render_scale * 100.0f))
+    Log(reshade::log::level::info,
+        "The game set r.ScreenPercentage to " + std::to_string(static_cast<int>(g_screen_percentage.game[0])) + ".");
 }
 
 void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
@@ -1201,6 +1361,15 @@ void OnOverlay(effect_runtime*) {
     if (permutation != kNotTaa)
       ImGui::Text("DLSS last replaced the TAA pass of %s.", kTaaPermutations[permutation].name);
     ImGui::TextWrapped("Reflex: %s", g_reflex_ready ? g_reflex.SleepStatus().c_str() : g_reflex.status().c_str());
+    if (g_diagnostics) {
+      if (const float* const percent = g_screen_percentage.values.load())
+        ImGui::TextWrapped("Development: render scale %.0f%% (RenderScale %.2f; the game's %.0f%%). DLSS does not "
+                           "upscale yet: the engine's own upsampling runs, and TAA-like passes go to the log.",
+                           percent[0], g_config.render_scale, g_screen_percentage.game[0]);
+      else
+        ImGui::TextWrapped("Development: RenderScale set, but r.ScreenPercentage not found (%s).",
+                           g_screen_percentage.detail.c_str());
+    }
     const float* const max_fps = g_max_fps.values.load();
     const int32_t* const sync = g_sync_interval.values.load();
     if (max_fps != nullptr && sync != nullptr)
@@ -1226,6 +1395,13 @@ void Initialize(HMODULE module) {
   g_data_dir = g_addon_dir / L"Persona3ReloadDLSS";
   g_ini_path = g_addon_dir / L"Persona3ReloadDLSS.ini";
   LoadConfig();
+  g_diagnostics = g_config.render_scale > 0.0f;
+  if (g_diagnostics) {
+    char scale[160];
+    std::snprintf(scale, sizeof(scale), "Development: render scale %.2f while DLSS runs on the upsampling path; "
+                  "TAA-like passes are logged.", g_config.render_scale);
+    Log(reshade::log::level::info, scale);
+  }
   char text[224];
   std::snprintf(text, sizeof(text),
                 "Loaded. DLSS %s; toggle key %s; %d jitter phases; upsampling path %s, mip bias %.2f; preset %d.",
