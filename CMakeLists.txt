@@ -14,6 +14,12 @@ if(NOT EXISTS ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib)
   message(FATAL_ERROR "DLSS SDK not found in ${DLSS_SDK_DIR}. Run tools/fetch_dlss_sdk.ps1 first.")
 endif()
 
+# NVIDIA's NVAPI (MIT, Reflex low-latency sleep), downloaded by tools/fetch_nvapi.ps1.
+set(NVAPI_DIR ${CMAKE_SOURCE_DIR}/third_party/nvapi)
+if(NOT EXISTS ${NVAPI_DIR}/amd64/nvapi64.lib)
+  message(FATAL_ERROR "NVAPI not found in ${NVAPI_DIR}. Run tools/fetch_nvapi.ps1 first.")
+endif()
+
 # ReShade's state tracking helper (BSD-3-Clause OR MIT).
 add_library(reshade_utils STATIC third_party/reshade/state_tracking.cpp)
 target_include_directories(reshade_utils PUBLIC third_party/reshade)
@@ -45,10 +51,11 @@ shader(kMotionVectorsCs motion_vectors.hlsl cs_5_0 main)
 configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
 
 add_library(Persona3ReloadDLSS SHARED src/addon.cpp src/console_variables.cpp src/descriptors.cpp src/dlss.cpp
-            ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
+            src/reflex.cpp ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
 target_include_directories(Persona3ReloadDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
-target_include_directories(Persona3ReloadDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
-target_link_libraries(Persona3ReloadDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12 dxgi)
+target_include_directories(Persona3ReloadDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR})
+target_link_libraries(Persona3ReloadDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib
+                      ${NVAPI_DIR}/amd64/nvapi64.lib d3d12 dxgi)
 set_target_properties(Persona3ReloadDLSS PROPERTIES SUFFIX ".addon64")
 
 # The HUD fix (docs/plan.md, "HUD fix"), a separate add-on. Its pixel shaders go into pipelines with the game's DXIL

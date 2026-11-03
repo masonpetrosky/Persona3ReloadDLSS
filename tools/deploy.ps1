@@ -65,6 +65,10 @@ JitterPhases=16
 UpsamplingPath=1
 ; The texture mip bias on that path; NVIDIA recommends -1.0 for DLAA, toward 0 if fine textures shimmer.
 MipBias=-1.00
+; NVIDIA Reflex low-latency mode (1 on, 0 off).
+Reflex=1
+; 0 keeps the game's frame rate limit; otherwise this cap (a few under the refresh rate with VRR, e.g. 237 at 240 Hz).
+FrameRateCap=0
 ; 1: DLSS gets the game's eye adaptation exposure; 0: DLSS estimates one.
 GameExposure=1
 '@ | Set-Content -Path $ini -Encoding ascii

@@ -35,6 +35,7 @@
 #include "console_variables.hpp"
 #include "descriptors.hpp"
 #include "dlss.hpp"
+#include "reflex.hpp"
 #include "state_tracking.hpp"
 #include "kMotionVectorsCs.h"
 
@@ -130,6 +131,12 @@ struct Config {
   // -0.3, the game's own path uses 0). NVIDIA's DLSS guide (3.5): native bias + log2(render / display width) - 1, so
   // -1 for DLAA; less negative if fine textures shimmer, never above 0.
   float mip_bias = -1.0f;
+  // NVIDIA Reflex low-latency mode (reflex.hpp), whether DLSS runs or not.
+  bool reflex = true;
+  // A frame rate cap in place of the game's, 0 to keep the game's. The game's frame rate option sets
+  // rhi.SyncInterval (VSync on every other refresh: 120 on a 240 Hz screen) and t.MaxFPS; with a cap the add-on
+  // presents on every refresh and caps through Reflex's sleep (or t.MaxFPS without Reflex).
+  float frame_rate_cap = 0.0f;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
 };
@@ -165,6 +172,53 @@ std::string g_upsampling_detail;
 std::atomic<float*> g_mip_bias_offset{nullptr};
 float g_mip_bias_game[2] = {0.0f, 0.0f};
 std::string g_mip_bias_detail;
+
+// An engine variable the add-on overrides at times while the game may change it too (from its options): the game's
+// own values are followed (a value the add-on did not write is the game's) and put back when the override ends.
+template <typename T>
+struct EngineVariable {
+  std::atomic<T*> values{nullptr};  // [0] the game thread's copy, [1] the render thread's
+  T game[2] = {};                   // the game's values
+  T written[2] = {};                // what the values were after the last Apply
+  bool overriding = false;
+  uint64_t game_writes = 0;         // how often the game wrote it (while overridden: how often it fought the override)
+  std::string detail;               // how it was found, readable once g_nvidia_ready
+
+  void Found(T* v) {
+    game[0] = written[0] = v[0];
+    game[1] = written[1] = v[1];
+    values = v;
+  }
+  // `want` while `ours`, the game's values otherwise. True when the game changed its values since the last call.
+  bool Apply(bool ours, T want) {
+    T* const v = values.load();
+    if (v == nullptr) return false;
+    bool changed = false;
+    for (int i = 0; i < 2; ++i) {
+      if (v[i] != written[i]) {  // the game wrote it
+        changed = changed || v[i] != game[i];
+        game[i] = v[i];
+        ++game_writes;
+      }
+      const T target = ours ? want : game[i];
+      if (v[i] != target) v[i] = target;
+      written[i] = target;
+    }
+    overriding = ours;
+    return changed;
+  }
+  void Restore() {
+    if (T* const v = values.exchange(nullptr)) {
+      v[0] = game[0];
+      v[1] = game[1];
+    }
+  }
+};
+EngineVariable<float> g_max_fps;       // t.MaxFPS: the engine's frame rate limit, 0 for none
+EngineVariable<int32_t> g_sync_interval;  // rhi.SyncInterval: present on every n-th refresh while VSync is on
+
+p3rdlss::Reflex g_reflex;  // started by the NVIDIA thread; g_reflex_ready once it has run
+std::atomic<bool> g_reflex_ready{false};
 std::atomic<int> g_last_permutation{kNotTaa};  // the TAA permutation DLSS replaced last
 
 std::atomic<uint64_t> g_frame{0};
@@ -247,6 +301,9 @@ void LoadConfig() {
   g_config.jitter_phases = std::clamp(ReadInt(L"JitterPhases", 16), 0, 64);
   g_config.upsampling_path = ReadInt(L"UpsamplingPath", 1) != 0;
   g_config.mip_bias = std::clamp(ReadFloat(L"MipBias", -1.0f), -2.0f, 0.0f);
+  g_config.reflex = ReadInt(L"Reflex", 1) != 0;
+  g_config.frame_rate_cap = ReadFloat(L"FrameRateCap", 0.0f);
+  if (g_config.frame_rate_cap != 0.0f) g_config.frame_rate_cap = std::clamp(g_config.frame_rate_cap, 30.0f, 1000.0f);
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -258,6 +315,8 @@ void SaveConfig() {
   WriteInt(L"JitterPhases", g_config.jitter_phases);
   WriteInt(L"UpsamplingPath", g_config.upsampling_path);
   WriteFloat(L"MipBias", g_config.mip_bias);
+  WriteInt(L"Reflex", g_config.reflex);
+  WriteFloat(L"FrameRateCap", g_config.frame_rate_cap);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
 }
@@ -847,6 +906,36 @@ void StartNvidia(ID3D12Device* device) {
     Log(reshade::log::level::warning, "r.ViewTextureMipBias.Offset not found (" + g_mip_bias_detail +
                                           "); the upsampling path keeps the engine's texture mip bias.");
   }
+  // The game's frame rate limit: t.MaxFPS (a frame rate, 0 for none) and rhi.SyncInterval (0 to 4).
+  float* max_fps = p3rdlss::FindFloatConsoleVariable(L"t.MaxFPS", &g_max_fps.detail);
+  const auto is_fps = [](float v) { return std::isfinite(v) && v >= 0.0f && v <= 10000.0f; };
+  if (max_fps != nullptr && !(is_fps(max_fps[0]) && is_fps(max_fps[1]))) {
+    g_max_fps.detail += ", but its values are no frame rates";
+    max_fps = nullptr;
+  }
+  int32_t* sync = p3rdlss::FindIntConsoleVariable(L"rhi.SyncInterval", &g_sync_interval.detail);
+  const auto is_interval = [](int32_t v) { return v >= 0 && v <= 4; };
+  if (sync != nullptr && !(is_interval(sync[0]) && is_interval(sync[1]))) {
+    g_sync_interval.detail += ", but its values are no sync intervals";
+    sync = nullptr;
+  }
+  {
+    char text[160];
+    std::snprintf(text, sizeof(text), "The game's frame rate limit: t.MaxFPS %s, rhi.SyncInterval %s.",
+                  max_fps != nullptr ? std::to_string(static_cast<int>(max_fps[0])).c_str() : "not found",
+                  sync != nullptr ? std::to_string(sync[0]).c_str() : "not found");
+    Log(reshade::log::level::info, text);
+    if (max_fps == nullptr) Log(reshade::log::level::warning, "t.MaxFPS: " + g_max_fps.detail);
+    if (sync == nullptr) Log(reshade::log::level::warning, "rhi.SyncInterval: " + g_sync_interval.detail);
+  }
+  if (max_fps != nullptr) g_max_fps.Found(max_fps);
+  if (sync != nullptr) g_sync_interval.Found(sync);
+  if (g_reflex.Init(device)) {
+    g_reflex_ready = true;
+    Log(reshade::log::level::info, "Reflex is available.");
+  } else {
+    Log(reshade::log::level::warning, "Reflex unavailable: " + g_reflex.status());
+  }
   const fs::path log_dir = g_data_dir / L"ngx";
   std::error_code ec;
   fs::create_directories(log_dir, ec);
@@ -888,6 +977,9 @@ void OnDestroyDevice(device* dev) {
     upsampling[0] = g_upsampling_game[0];
     upsampling[1] = g_upsampling_game[1];
   }
+  g_max_fps.Restore();
+  g_sync_interval.Restore();
+  if (g_reflex_ready.exchange(false)) g_reflex.Configure(false, 0);
   if (float* const bias = g_mip_bias_offset.exchange(nullptr)) {
     bias[0] = g_mip_bias_game[0];
     bias[1] = g_mip_bias_game[1];
@@ -961,6 +1053,20 @@ void ApplyEngineVariables() {
       if (bias[i] != want) bias[i] = want;
     }
   }
+  // Reflex and the frame rate cap, whether DLSS runs or not. With a cap the game presents on every refresh instead of
+  // every other one, and Reflex's sleep holds the cap (the engine's t.MaxFPS stays off then, so that only one limiter
+  // waits); without Reflex t.MaxFPS does.
+  const float cap = g_config.frame_rate_cap;
+  const bool capping = cap > 0.0f;
+  const bool reflex_on = g_config.reflex && g_reflex_ready;
+  const bool reflex_caps = capping && reflex_on;
+  const bool sync_ours = capping && (g_sync_interval.game[0] > 1 || g_sync_interval.game[1] > 1);
+  if (g_sync_interval.Apply(sync_ours, 1))
+    Log(reshade::log::level::info, "The game set rhi.SyncInterval to " + std::to_string(g_sync_interval.game[0]) + ".");
+  if (g_max_fps.Apply(capping, reflex_caps ? 0.0f : cap))
+    Log(reshade::log::level::info,
+        "The game set t.MaxFPS to " + std::to_string(static_cast<int>(g_max_fps.game[0])) + ".");
+  if (g_reflex_ready) g_reflex.Configure(reflex_on, reflex_caps ? static_cast<uint32_t>(1e6f / cap) : 0u);
 }
 
 void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
@@ -1056,6 +1162,21 @@ void OnOverlay(effect_runtime*) {
   ImGui::SetItemTooltip("Give DLSS the game's eye adaptation exposure. Off lets DLSS estimate one.");
 
   ImGui::Separator();
+  if (ImGui::Checkbox("NVIDIA Reflex low latency", &g_config.reflex)) SaveConfig();
+  ImGui::SetItemTooltip("When the GPU is the limit, the game's CPU side runs ahead and queues finished frames, each "
+                        "adding a frame of input latency. Reflex holds the CPU back so every frame starts just in "
+                        "time. Injected at the present, as the game has no Reflex of its own.");
+  float cap = g_config.frame_rate_cap;
+  if (ImGui::InputFloat("Frame rate cap", &cap, 1.0f, 10.0f, "%.0f")) {
+    g_config.frame_rate_cap = cap <= 0.0f ? 0.0f : std::clamp(cap, 30.0f, 1000.0f);
+  }
+  if (ImGui::IsItemDeactivatedAfterEdit()) SaveConfig();
+  ImGui::SetItemTooltip("0 keeps the game's limit (its frame rate option). With a cap the game presents on every "
+                        "refresh instead of every other one, and Reflex's sleep holds the cap (the engine's t.MaxFPS "
+                        "without Reflex). With a variable refresh rate display, a few frames under its refresh rate, "
+                        "for example 237 at 240 Hz.");
+
+  ImGui::Separator();
   ImGui::TextWrapped("DLSS: %s", DlssStatus().c_str());
   {
     std::lock_guard lock(g_info_mutex);
@@ -1079,6 +1200,15 @@ void OnOverlay(effect_runtime*) {
     const int permutation = g_last_permutation.load();
     if (permutation != kNotTaa)
       ImGui::Text("DLSS last replaced the TAA pass of %s.", kTaaPermutations[permutation].name);
+    ImGui::TextWrapped("Reflex: %s", g_reflex_ready ? g_reflex.SleepStatus().c_str() : g_reflex.status().c_str());
+    const float* const max_fps = g_max_fps.values.load();
+    const int32_t* const sync = g_sync_interval.values.load();
+    if (max_fps != nullptr && sync != nullptr)
+      ImGui::Text("Frame rate limit: t.MaxFPS %.0f, sync interval %d (the game's: %.0f and %d)", max_fps[0], sync[1],
+                  g_max_fps.game[0], g_sync_interval.game[1]);
+    else
+      ImGui::TextWrapped("Frame rate limit: the game's (t.MaxFPS %s, rhi.SyncInterval %s)", g_max_fps.detail.c_str(),
+                         g_sync_interval.detail.c_str());
   }
   const uint64_t last = g_last_dlss_frame.load();
   if (g_dlss_frames.load() != 0 && last + 2 >= g_frame.load())
@@ -1126,6 +1256,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      // Reflex: the present markers after every other present callback, right before the swap chain presents; the
+      // sleep right after it; the frame's first submission.
+      reshade::register_event<reshade::addon_event::present>(
+          [](command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+            if (g_reflex_ready) g_reflex.BeforePresent();
+          });
+      reshade::register_event<reshade::addon_event::finish_present>([](command_queue*, swapchain*) {
+        if (g_reflex_ready) g_reflex.AfterPresent();
+      });
+      reshade::register_event<reshade::addon_event::execute_command_list>([](command_queue*, command_list*) {
+        if (g_reflex_ready) g_reflex.OnSubmit();
+      });
       reshade::register_overlay(nullptr, OnOverlay);
       break;
     case DLL_PROCESS_DETACH:

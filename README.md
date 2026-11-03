@@ -47,6 +47,8 @@ what the add-on is doing. The add-on logs to `ReShade.log`, prefixed `[P3RDLSS]`
 | `JitterPhases` | 16 | the camera jitter's phases while DLSS runs; 0 keeps the game's |
 | `UpsamplingPath` | 1 | while DLSS runs, the engine's temporal upsampling path: Halton jitter over the whole pixel and the texture mip bias below; 0 keeps the game's TAA path (jitter in a disc, mip bias 0) |
 | `MipBias` | -1.0 | the texture mip bias on that path (`r.ViewTextureMipBias.Offset`, the engine's default -0.3): NVIDIA's recommendation for DLAA is -1.0; toward 0 if fine textures shimmer |
+| `Reflex` | 1 | NVIDIA Reflex low-latency mode, injected at the present (the game has none), with or without DLSS |
+| `FrameRateCap` | 0 | 0 keeps the game's frame rate limit; otherwise the game presents on every refresh (`rhi.SyncInterval` 1 instead of the game's 2 at 120 fps) and Reflex's sleep holds this cap (`t.MaxFPS` without Reflex); with a variable refresh rate display a few frames under its refresh rate, such as 237 at 240 Hz |
 | `GameExposure` | 1 | DLSS gets the game's eye adaptation exposure; 0 lets DLSS estimate one |
 | `MotionVectors` | 0 | development: 1 camera motion only, 2 none |
 
