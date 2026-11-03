@@ -32,7 +32,8 @@ try:
     for eid in [int(e) for e in os.environ["P3R_EIDS"].split(",") if e.strip()]:
         controller.SetFrameEvent(eid, False)
         pipe = controller.GetPipelineState()
-        for stage, name in ((rd.ShaderStage.Vertex, "vs"), (rd.ShaderStage.Pixel, "ps")):
+        for stage, name in ((rd.ShaderStage.Vertex, "vs"), (rd.ShaderStage.Pixel, "ps"),
+                            (rd.ShaderStage.Compute, "cs")):
             refl = pipe.GetShaderReflection(stage)
             if refl is None:
                 continue

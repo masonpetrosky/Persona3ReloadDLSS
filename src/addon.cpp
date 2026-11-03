@@ -109,6 +109,7 @@ static_assert(sizeof(MotionConstants) == 24 * 4);
 struct __declspec(uuid("6d2f8a41-93c7-4e5b-a0d6-1f4b7c9e2a58")) CmdData {
   pipeline current = {0};  // the pipeline state the game set last
   int taa = kNotTaa;       // its TAA permutation (kTaaPermutations), if it is one
+  bool taa_like = false;   // development: its shader declares TAAStandalone's registers (DeclaresTaaRegisters)
   // The root constant buffers the game set (SetComputeRootConstantBufferView) for the compute root signature
   // `cbv_layout`, by root parameter. The descriptor tracking only covers descriptor tables.
   pipeline_layout cbv_layout = {0};
@@ -241,7 +242,8 @@ std::atomic<float> g_last_jitter_x{0.0f}, g_last_jitter_y{0.0f};
 
 std::shared_mutex g_taa_mutex;
 std::unordered_map<uint64_t, int> g_taa_pipelines;  // pipeline handle -> TAA permutation
-// Development (RenderScale > 0 at load): the digest of every compute pipeline, to name TAA-like passes in the log.
+// Development (RenderScale > 0 at load): the digests of the compute pipelines whose shaders declare TAAStandalone's
+// registers (DeclaresTaaRegisters), the only ones whose dispatches LogTaaPass looks at.
 using Digest = std::array<uint8_t, 16>;
 bool g_diagnostics = false;
 std::unordered_map<uint64_t, Digest> g_compute_digests;
@@ -370,6 +372,60 @@ bool DxilDigest(const shader_desc* cs, Digest* out) {
   return false;
 }
 
+// Whether a DXIL compute shader declares TAAStandalone's registers: typed SRVs t0 to t5 (eye adaptation, color, depth,
+// velocity, stencil, history), a typed UAV u0 and constant buffers b0 and b1, all in space 0 (LogTaaPass reads all of
+// them). From the container's PSV0 part (pipeline state
+// validation): its runtime info size and info, the resource count, the size of one binding and the bindings (type,
+// space, lower and upper register). Only such shaders' bindings are looked at in the log: the registers a shader
+// does not declare can hold stale descriptors of textures that no longer exist.
+bool DeclaresTaaRegisters(const shader_desc* cs) {
+  if (cs == nullptr || cs->code == nullptr || cs->code_size < 32) return false;
+  const auto* const code = static_cast<const uint8_t*>(cs->code);
+  if (std::memcmp(code, "DXBC", 4) != 0) return false;
+  uint32_t parts = 0;
+  std::memcpy(&parts, code + 28, 4);
+  for (uint32_t i = 0; i < parts && 32 + 4 * (size_t{i} + 1) <= cs->code_size; ++i) {
+    uint32_t offset = 0, size = 0;
+    std::memcpy(&offset, code + 32 + 4 * i, 4);
+    if (offset > cs->code_size || cs->code_size - offset < 8 || std::memcmp(code + offset, "PSV0", 4) != 0) continue;
+    std::memcpy(&size, code + offset + 4, 4);
+    const uint8_t* p = code + offset + 8;
+    const uint8_t* const end = p + (std::min)(static_cast<size_t>(size), cs->code_size - offset - 8);
+    const auto read = [&](uint32_t* v) {
+      if (end - p < 4) return false;
+      std::memcpy(v, p, 4);
+      p += 4;
+      return true;
+    };
+    uint32_t info_size = 0, count = 0, bind_size = 0;
+    if (!read(&info_size) || static_cast<size_t>(end - p) < info_size) return false;
+    p += info_size;
+    if (!read(&count) || count == 0 || !read(&bind_size) || bind_size < 16 ||
+        static_cast<size_t>(end - p) < static_cast<size_t>(count) * bind_size)
+      return false;
+    constexpr uint32_t kCbv = 2, kSrvTyped = 3, kUavTyped = 6;
+    bool srv[6] = {}, uav0 = false, cbv[2] = {};
+    for (uint32_t r = 0; r < count; ++r, p += bind_size) {
+      uint32_t type, space, lower, upper;
+      std::memcpy(&type, p, 4);
+      std::memcpy(&space, p + 4, 4);
+      std::memcpy(&lower, p + 8, 4);
+      std::memcpy(&upper, p + 12, 4);
+      if (space != 0) continue;
+      const auto covers = [&](uint32_t reg) { return lower <= reg && reg <= upper; };
+      if (type == kSrvTyped)
+        for (uint32_t t = 0; t < 6; ++t) srv[t] = srv[t] || covers(t);
+      if (type == kUavTyped) uav0 = uav0 || covers(0);
+      if (type == kCbv) {
+        cbv[0] = cbv[0] || covers(0);
+        cbv[1] = cbv[1] || covers(1);
+      }
+    }
+    return srv[0] && srv[1] && srv[2] && srv[3] && srv[4] && srv[5] && uav0 && cbv[0] && cbv[1];
+  }
+  return false;
+}
+
 // The TAA permutation of a compute shader, by its digest.
 int FindTaaPermutation(const Digest& digest) {
   for (int p = 0; p < static_cast<int>(std::size(kTaaPermutations)); ++p)
@@ -386,9 +442,10 @@ std::string Hex(const Digest& digest) {
 void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
   for (uint32_t i = 0; i < count; ++i) {
     if (subobjects[i].type != pipeline_subobject_type::compute_shader) continue;
+    const auto* const cs = static_cast<const shader_desc*>(subobjects[i].data);
     Digest digest = {};
-    if (!DxilDigest(static_cast<const shader_desc*>(subobjects[i].data), &digest)) return;
-    if (g_diagnostics) {
+    if (!DxilDigest(cs, &digest)) return;
+    if (g_diagnostics && DeclaresTaaRegisters(cs)) {
       std::unique_lock lock(g_taa_mutex);
       g_compute_digests[p.handle] = digest;
     }
@@ -429,6 +486,7 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
   std::shared_lock lock(g_taa_mutex);
   const auto it = g_taa_pipelines.find(p.handle);
   data->taa = it != g_taa_pipelines.end() ? it->second : kNotTaa;
+  data->taa_like = g_diagnostics && g_compute_digests.count(p.handle) != 0;
 }
 
 void OnPushDescriptors(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t param,
@@ -979,7 +1037,7 @@ void LogTaaPass(command_list* cmd_list, const CmdData& data, uint32_t gx, uint32
 bool OnDispatch(command_list* cmd_list, uint32_t gx, uint32_t gy, uint32_t gz) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
-  if (g_diagnostics) LogTaaPass(cmd_list, *data, gx, gy, gz);
+  if (data->taa_like) LogTaaPass(cmd_list, *data, gx, gy, gz);
   if (data->taa == kNotTaa) return false;
   if (!ReplaceTaa(cmd_list, *data)) return false;
   if (g_last_permutation.exchange(data->taa) != data->taa)
