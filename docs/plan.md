@@ -73,6 +73,11 @@ Expected obstacles:
    `UpsamplingPath`, default on); built, not installed yet. The engine's mip bias on that path is -0.3; the add-on
    sets NVIDIA's -1.0 for DLAA instead (`MipBias`, `r.ViewTextureMipBias.Offset`), to judge in game for shimmer on fine
    textures. Still open: whether the dorm's planar reflection behaves the same on this path.
+   Upscaling, 2026-11-03 (9ef2d0d, installed 18:23 with Mode 1): DLSS replaces the permutation below 100%
+   (a82d5ad9), "render 1920x1080 to 2560x1440, output 3840x2160", 9,000 frames without a failure. Paulownia Mall,
+   PresentMon (`tools/pm_summary.py`, `captures/perf`): DLAA 88.2 fps (11.34 ms, GPU busy 99%), Quality 142.5 fps
+   (7.02 ms, still GPU-bound): +62%. Balanced, Performance and Ultra Performance not run yet (Ultra Performance may
+   use another permutation).
    Installed 2026-11-03 17:10 (e5e3cbb); first start 17:27: all three variables found (the engine's mip bias offset
    -0.30), the engine built the upsampling permutation as soon as DLSS was available, "DLSS replaces the TAA pass of
    the engine's temporal upsampling", 9,000 frames without a failure, and the logged jitter positions are points of
