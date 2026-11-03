@@ -185,6 +185,25 @@ protagonist running and the camera following, taken with `tools\launch_rdc_upsam
   0.043 and more. From 9459 to 9460, the game's long step after RenderDoc saved two frames (569 px): 0.599 against
   1.108 and more (camera), 0.116 against 0.934 and more (velocity). The jitter sign is +1 again.
 
+### Temporal upsampling below 100% (2026-11-03, from the add-on's own log)
+
+A RenderDoc capture at 67% ran the PC out of memory twice (the game holds 18 GB of the 32 GB under RenderDoc), so the
+add-on's development setting `RenderScale` (3f8b0ed) set `r.ScreenPercentage` 67 and logged the pass instead.
+
+- The engine runs a third TAAStandalone permutation, DXIL `a82d5ad988f34ae25a191b7f4cf3478c` (stock 4.27 has one
+  per screen percentage range), 480x270 groups: the output's 8x8 tiles.
+- The same slots: t0 eye adaptation, t1 color, t2 depth, t3 velocity, t4 stencil at the render buffer size
+  (2576x1448; the view is 2573x1448 at 0,0), t5 history and u0 output at 3840x2160.
+- `$Globals`: `bCameraCut` +8, `ViewportUVToInputBufferUV` +240 (0.9988, 1), `InputSceneColorSize` +304
+  (2576x1448), `InputMinPixelCoord`/`InputMaxPixelCoord` +320 (0,0 and 2572,1447), `HistoryBufferSize` +336 and
+  `OutputViewportSize` +368 (3840x2160), the input view size +432 (2573x1448), `TemporalJitterPixels` +448
+  (-0.0625, +0.3148: Halton point 14), `ScreenPercentage` +456 (0.67005), `UpscaleFactor` +460 (1.4924);
+  `CurrentFrameWeight` +4 is 0.04 here.
+- View: `ViewSizeAndInvSize` +2080 is the render view (2573x1448), `BufferSizeAndInvSize` +2112 the input buffers
+  (2576x1448); `TemporalAAJitter` +2016 is in clip units of the render view, so DLSS's jitter is it times half the
+  render size (x: -4.858e-5 x 2573 / 2 = -0.0625 px). `MaterialTextureMipBias` +2292 is -1.5777 = log2(0.67005) - 1:
+  with `r.ViewTextureMipBias.Offset` at -1 (`MipBias`) the engine applies NVIDIA's formula by itself.
+
 ### The minimap flash under RenoDX (2026-11-03)
 
 RenoDX's known P3R issue: a bright hard-edged shape over the minimap while the HUD slides in after unpausing.
