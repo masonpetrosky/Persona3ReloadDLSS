@@ -73,6 +73,10 @@ Expected obstacles:
    `UpsamplingPath`, default on); built, not installed yet. The engine's mip bias on that path is -0.3; the add-on
    sets NVIDIA's -1.0 for DLAA instead (`MipBias`, `r.ViewTextureMipBias.Offset`), to judge in game for shimmer on fine
    textures. Still open: whether the dorm's planar reflection behaves the same on this path.
+   Installed 2026-11-03 17:10 (e5e3cbb); first start 17:27: all three variables found (the engine's mip bias offset
+   -0.30), the engine built the upsampling permutation as soon as DLSS was available, "DLSS replaces the TAA pass of
+   the engine's temporal upsampling", 9,000 frames without a failure, and the logged jitter positions are points of
+   the 16-phase uniform Halton sequence (3, 5, 11, 14).
 4. **Release.** README, GitHub, Nexus (each confirmed with the user).
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
@@ -105,6 +109,12 @@ Checks:
 2. Its own counters (log and overlay): clamped draws per frame; zero while no HUD is on screen.
 3. In game (only the user can judge it): no bright shape over the minimap while the HUD slides in after unpausing,
    nothing else in the HUD changes; frame time unchanged.
+
+Result 2026-11-03 (0d9fb62 installed 17:22, game started 17:27): loaded next to RenoDX and the DLSS add-on without
+errors; 9 HUD pipelines got clamps, one reverse subtract (the mask's cut-out, "below 0") and eight adding ones
+(SrcAlpha or One plus One, "above 1"), none failed; at most 99 clamped draws in a frame. The user after pausing and
+unpausing: "The pause/unpause looks good now". Not measured: its GPU cost (expected in hundredths of a millisecond:
+alpha-only redraws of the HUD's own pixels; the game is capped at 60 fps).
 
 ## Workflow
 
