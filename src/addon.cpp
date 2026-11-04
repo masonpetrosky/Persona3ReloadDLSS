@@ -152,6 +152,8 @@ struct Config {
   bool log_taa_passes = false;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
+  // Development: frame and shader dumps for offline analysis (DevDump below), read at load.
+  bool dev_dumps = false;
 };
 
 Config g_config;
@@ -349,6 +351,7 @@ void LoadConfig() {
   g_config.render_scale = ReadFloat(L"RenderScale", 0.0f);
   if (g_config.render_scale != 0.0f) g_config.render_scale = std::clamp(g_config.render_scale, 0.33f, 1.0f);
   g_config.log_taa_passes = ReadInt(L"LogTaaPasses", 0) != 0;
+  g_config.dev_dumps = ReadInt(L"DevDumps", 0) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -469,7 +472,148 @@ std::string Hex(const Digest& digest) {
   return text;
 }
 
+// --- Development: frame and shader dumps (DevDumps=1) ----------------------------------------------------------
+
+// For offline analysis without a graphics debugger (RenderDoc runs out of memory in this game): every pixel and
+// compute shader the game creates goes once to Persona3ReloadDLSS\dev\shaders\<ps|cs>_<digest>.dxil, and when a file
+// Persona3ReloadDLSS\dev\dump.txt appears (holding a frame count, default 4; looked for every 30 frames), the next
+// DLSS frames' TAA input color (render size) and DLSS output are copied to readback buffers and written to dev\frames
+// as raw RGBA16F rows (<frame>_color_<w>x<h>.bin, <frame>_output_<w>x<h>.bin), with a line of frames.jsonl each
+// (sizes, jitter, pre-exposure, jitter phases, reset). The copies use the states DLSS needs those resources in: the
+// color as a non-pixel shader resource, the output as an unordered access view.
+fs::path g_dev_dir;
+std::mutex g_dev_mutex;
+std::unordered_set<std::string> g_dev_shaders;  // shaders written so far
+std::atomic<int> g_dev_frames_left{0};          // DLSS frames still to dump
+
+struct DevCopy {
+  resource buffer = {0};
+  uint32_t width = 0, height = 0, row_pixels = 0;
+  uint64_t size = 0;
+  std::string name;
+};
+struct DevFrame {
+  uint64_t frame = 0;
+  std::vector<DevCopy> copies;
+  std::string json;
+};
+std::vector<DevFrame> g_dev_pending;  // copies recorded, not yet read back
+
+FILE* DevOpen(const fs::path& path, const wchar_t* mode) {
+  FILE* file = nullptr;
+  return _wfopen_s(&file, path.c_str(), mode) == 0 ? file : nullptr;
+}
+
+void DevDumpShaders(uint32_t count, const pipeline_subobject* subobjects) {
+  for (uint32_t i = 0; i < count; ++i) {
+    const char* const stage = subobjects[i].type == pipeline_subobject_type::pixel_shader     ? "ps"
+                              : subobjects[i].type == pipeline_subobject_type::compute_shader ? "cs"
+                                                                                              : nullptr;
+    if (stage == nullptr || subobjects[i].data == nullptr) continue;
+    const auto* const desc = static_cast<const shader_desc*>(subobjects[i].data);
+    Digest digest = {};
+    if (!DxilDigest(desc, &digest)) continue;
+    const std::string name = std::string(stage) + "_" + Hex(digest) + ".dxil";
+    {
+      std::lock_guard lock(g_dev_mutex);
+      if (!g_dev_shaders.insert(name).second) continue;
+    }
+    if (FILE* const f = DevOpen(g_dev_dir / L"shaders" / name, L"wb")) {
+      std::fwrite(desc->code, 1, desc->code_size, f);
+      std::fclose(f);
+    }
+  }
+}
+
+// Records copies of this DLSS frame's input color and output while a dump is under way.
+void DevDumpFrame(command_list* cmd, resource color, uint32_t render_width, uint32_t render_height, resource output,
+                  uint32_t width, uint32_t height, const std::string& json) {
+  if (g_dev_frames_left.fetch_sub(1) <= 0) {
+    g_dev_frames_left = 0;
+    return;
+  }
+  device* const dev = cmd->get_device();
+  DevFrame frame;
+  frame.frame = g_frame.load();
+  frame.json = json;
+  const auto copy = [&](resource src, resource_usage state, uint32_t w, uint32_t h, const char* name) {
+    const uint32_t row = (w + 31) / 32 * 32;  // 8 bytes a pixel: rows of a multiple of 256 bytes, as D3D12 wants
+    const uint64_t size = uint64_t{row} * h * 8;
+    resource buffer = {0};
+    if (!dev->create_resource(resource_desc(size, memory_heap::readback, resource_usage::copy_dest), nullptr,
+                              resource_usage::copy_dest, &buffer))
+      return;
+    cmd->barrier(src, state, resource_usage::copy_source);
+    const subresource_box box = {0, 0, 0, w, h, 1};
+    cmd->copy_texture_to_buffer(src, 0, &box, buffer, 0, row, h);
+    cmd->barrier(src, resource_usage::copy_source, state);
+    frame.copies.push_back({buffer, w, h, row, size, name});
+  };
+  copy(color, resource_usage::shader_resource_non_pixel, render_width, render_height, "color");
+  copy(output, resource_usage::unordered_access, width, height, "output");
+  std::lock_guard lock(g_dev_mutex);
+  g_dev_pending.push_back(std::move(frame));
+}
+
+// At the present: arms a dump when the trigger file appears, and writes the dumps whose frames the GPU has finished.
+void DevDumpPresent(command_queue* queue, uint64_t frame) {
+  if (frame % 30 == 0) {
+    const fs::path trigger = g_dev_dir / L"dump.txt";
+    std::error_code error;
+    if (fs::exists(trigger, error)) {
+      int count = 4;
+      if (FILE* const f = DevOpen(trigger, L"rb")) {
+        char text[16] = {};
+        const int n = std::fgets(text, sizeof(text), f) != nullptr ? std::atoi(text) : 0;
+        if (n > 0 && n <= 32) count = n;
+        std::fclose(f);
+      }
+      fs::remove(trigger, error);
+      g_dev_frames_left = count;
+      Log(reshade::log::level::info, "Development: dumping the next " + std::to_string(count) + " DLSS frames.");
+    }
+  }
+  std::vector<DevFrame> ready;
+  {
+    std::lock_guard lock(g_dev_mutex);
+    for (auto it = g_dev_pending.begin(); it != g_dev_pending.end();) {
+      if (frame > it->frame + 2) {
+        ready.push_back(std::move(*it));
+        it = g_dev_pending.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (ready.empty()) return;
+  queue->wait_idle();
+  device* const dev = queue->get_device();
+  for (DevFrame& f : ready) {
+    for (DevCopy& c : f.copies) {
+      void* data = nullptr;
+      if (dev->map_buffer_region(c.buffer, 0, c.size, map_access::read_only, &data) && data != nullptr) {
+        char name[96];
+        std::snprintf(name, sizeof(name), "%06llu_%s_%ux%u.bin", static_cast<unsigned long long>(f.frame),
+                      c.name.c_str(), c.width, c.height);
+        if (FILE* const out = DevOpen(g_dev_dir / L"frames" / name, L"wb")) {
+          for (uint32_t y = 0; y < c.height; ++y)
+            std::fwrite(static_cast<const uint8_t*>(data) + size_t{y} * c.row_pixels * 8, 8, c.width, out);
+          std::fclose(out);
+        }
+        dev->unmap_buffer_region(c.buffer);
+      }
+      dev->destroy_resource(c.buffer);
+    }
+    if (FILE* const out = DevOpen(g_dev_dir / L"frames" / L"frames.jsonl", L"ab")) {
+      std::fputs((f.json + "\n").c_str(), out);
+      std::fclose(out);
+    }
+    Log(reshade::log::level::info, "Development: dumped DLSS frame " + std::to_string(f.frame) + ".");
+  }
+}
+
 void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
+  if (g_config.dev_dumps) DevDumpShaders(count, subobjects);
   for (uint32_t i = 0; i < count; ++i) {
     if (subobjects[i].type != pipeline_subobject_type::compute_shader) continue;
     const auto* const cs = static_cast<const shader_desc*>(subobjects[i].data);
@@ -958,6 +1102,18 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     }
     return false;
   }
+  if (g_config.dev_dumps && g_dev_frames_left.load() > 0) {
+    const int32_t* const samples = g_taa_samples.load();
+    char json[448];
+    std::snprintf(json, sizeof(json),
+                  "{\"frame\": %llu, \"dispatch\": %llu, \"render\": [%u, %u], \"input\": [%u, %u], \"output\": [%u, %u], "
+                  "\"jitter\": [%.6f, %.6f], \"pre_exposure\": %.6g, \"phases\": %d, \"reset\": %d, \"mode\": %d, "
+                  "\"preset\": %d}",
+                  static_cast<unsigned long long>(frame), static_cast<unsigned long long>(dispatch), render_width,
+                  render_height, in_width, in_height, width, height, jitter_x, jitter_y, c.pre_exposure,
+                  samples != nullptr ? samples[1] : -1, in.reset ? 1 : 0, g_config.mode, g_config.preset);
+    DevDumpFrame(cmd_list, color, render_width, render_height, output, width, height, json);
+  }
   g_last_dlss_frame = frame;
   g_render_width = render_width;
   g_render_height = render_height;
@@ -1373,6 +1529,7 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
     g_dlss.ReleaseFeature();
     g_recreate = false;
   }
+  if (g_config.dev_dumps) DevDumpPresent(queue, frame);
   if (g_device != nullptr) {
     std::lock_guard lock(g_dlss_mutex);
     for (auto it = g_retired.begin(); it != g_retired.end();) {
@@ -1535,6 +1692,14 @@ void Initialize(HMODULE module) {
   LoadConfig();
   g_diagnostics = g_config.log_taa_passes;
   if (g_diagnostics) Log(reshade::log::level::info, "Development: TAA-like passes are logged (LogTaaPasses).");
+  if (g_config.dev_dumps) {
+    g_dev_dir = g_data_dir / L"dev";
+    std::error_code error;
+    fs::create_directories(g_dev_dir / L"shaders", error);
+    fs::create_directories(g_dev_dir / L"frames", error);
+    Log(reshade::log::level::info, "Development: shaders go to Persona3ReloadDLSS\\dev\\shaders, and a file "
+                                   "dev\\dump.txt dumps the next DLSS frames (DevDumps).");
+  }
   if (g_config.render_scale > 0.0f) {
     char scale[128];
     std::snprintf(scale, sizeof(scale), "Development: render scale %.2f in place of the mode's (RenderScale).",
