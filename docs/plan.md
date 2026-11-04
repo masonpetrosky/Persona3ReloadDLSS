@@ -87,7 +87,11 @@ Expected obstacles:
    the 16-phase uniform Halton sequence (3, 5, 11, 14).
 4. **Release.** README, GitHub, Nexus (each confirmed with the user). 2026-11-03: 0.1.0's zips are built locally
    (`tools\package.ps1`: DLSS and the HUD fix as two zips laid out like the game's folder, README.txt and licenses
-   inside, versions in the DLLs and the load log line; `CHANGELOG.md`); nothing published, no GitHub repository yet.
+   inside, versions in the DLLs and the load log line; `CHANGELOG.md`). Published the same evening with the user's
+   OK: this repository went public with the release v0.1.0 (both zips), and the Nexus Mods page
+   [persona3reload/mods/109](https://www.nexusmods.com/persona3reload/mods/109) has the DLSS zip as the main file
+   and the HUD fix as an optional file. Before that the user ran Ultra Performance with the phase cap: the log
+   showed 14 jitter phases and 0 corner jitter frames.
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
 
