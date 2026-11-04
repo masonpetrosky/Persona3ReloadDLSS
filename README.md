@@ -7,7 +7,8 @@ game's 120 FPS limit. A second, separate add-on fixes a HUD glitch that RenoDX's
 open source (MIT).
 
 Download: the ready-to-use zips are on the [Releases](https://github.com/masonpetrosky/Persona3ReloadDLSS/releases)
-page; each one's README.txt says how to install it. Developed and tested on one machine (RTX 5070 Ti, 4K, HDR with
+page and on [Nexus Mods](https://www.nexusmods.com/persona3reload/mods/109); each one's README.txt says how to
+install it. Developed and tested on one machine (RTX 5070 Ti, 4K, HDR with
 RenoDX, Steam build 22672075, ReShade 6.8). The reverse engineering behind it is in [docs/recon.md](docs/recon.md),
 the plan and its results in [docs/plan.md](docs/plan.md), the versions in [CHANGELOG.md](CHANGELOG.md).
 
