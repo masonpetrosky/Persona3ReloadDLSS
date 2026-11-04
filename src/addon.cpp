@@ -156,8 +156,6 @@ struct Config {
   bool log_taa_passes = false;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
-  // While DLSS runs, a random sample index for the engine's dithered materials (RandomizeDither below).
-  bool random_dither = true;
   // Development: frame and shader dumps for offline analysis (DevDump below), read at load.
   bool dev_dumps = false;
 };
@@ -254,6 +252,10 @@ struct EngineVariable {
 EngineVariable<float> g_max_fps;       // t.MaxFPS: the engine's frame rate limit, 0 for none
 EngineVariable<int32_t> g_sync_interval;  // rhi.SyncInterval: present on every n-th refresh while VSync is on
 EngineVariable<float> g_screen_percentage;  // r.ScreenPercentage: the render scale in percent (development, stage 3)
+// r.AmbientOcclusionLevels: SSAO's levels (-1 automatic, 0 off). Development: off from the overlay, to test whether
+// the 4x4 grid DLSS shows on skin and in corners comes from SSAO's noise (DevDumps=1).
+EngineVariable<int32_t> g_ao_levels;
+std::atomic<bool> g_dev_no_ssao{false};
 
 p3rdlss::Reflex g_reflex;  // started by the NVIDIA thread; g_reflex_ready once it has run
 std::atomic<bool> g_reflex_ready{false};
@@ -358,7 +360,6 @@ void LoadConfig() {
   if (g_config.render_scale != 0.0f) g_config.render_scale = std::clamp(g_config.render_scale, 0.33f, 1.0f);
   g_config.log_taa_passes = ReadInt(L"LogTaaPasses", 0) != 0;
   g_config.dev_dumps = ReadInt(L"DevDumps", 0) != 0;
-  g_config.random_dither = ReadInt(L"RandomDither", 1) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -375,7 +376,6 @@ void SaveConfig() {
   WriteInt(L"Mode", g_config.mode);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
-  WriteInt(L"RandomDither", g_config.random_dither);
 }
 
 void SetDlssEnabled(bool enabled) {
@@ -671,136 +671,8 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
   data->taa_like = g_diagnostics && g_compute_digests.count(p.handle) != 0;
 }
 
-// --- The engine's temporal dither, unlocked from the jitter -------------------------------------------------------
-
-// The game's dithered materials (a 4x4 pattern on skin that shifts every frame) take their frame-to-frame offset from
-// View.TemporalAAParams.x, the TAA sample index, which also picks the camera jitter: each jitter position always meets
-// the same dither state. The game's TAA blurs the states together; DLSS puts every frame's samples at their jitter
-// positions and keeps the dither as a fine grid (seen on Junpei's cheek; docs/recon.md). While DLSS runs, every copy
-// of the main view's View constants a frame binds (the engine uploads them more than once a frame; recognized by a view
-// size equal to DLSS's render size and an index below the sample count) gets the same random index, written through
-// the CPU mapping of the engine's upload buffer when the copy is first bound, before the GPU runs the passes that read
-// it: the dither then changes at random against the jitter, and DLSS averages it like noise. The jitter itself
-// (TemporalAAJitter) is left alone. Each recording thread remembers the constant buffers it has looked at this frame,
-// so a bind seen before costs one lookup; upload buffers stay mapped until the engine destroys them.
-constexpr uint32_t kMaxDitherChecks = 8192;  // constant buffers looked at in a frame, at most
-std::atomic<bool> g_dither_active{false};    // RandomDither on and DLSS ran in the last frames
-std::atomic<uint32_t> g_dither_checked{0};   // this frame: constant buffers looked at
-std::atomic<uint32_t> g_dither_copies{0};    // this frame: copies of the View constants given the random index
-std::atomic<int64_t> g_dither_ticks{0};      // this frame: time spent looking (QPC ticks)
-std::atomic<uint64_t> g_dither_frame{0};     // the last frame with at least one copy changed
-std::atomic<uint64_t> g_dither_frames{0};    // frames so far
-std::atomic<float> g_dither_from{0.0f}, g_dither_to{0.0f}, g_dither_count{0.0f};
-std::atomic<uint32_t> g_dither_last_checked{0}, g_dither_last_copies{0};  // the last finished frame's numbers
-std::atomic<float> g_dither_last_ms{0.0f};
-std::mutex g_dither_mutex;
-std::unordered_map<uint64_t, std::pair<uint8_t*, uint64_t>> g_dither_mapped;  // upload buffer -> CPU pointer, size
-
-struct DitherThreadCache {
-  uint64_t frame = 0;
-  std::unordered_set<uint64_t> keys;  // buffer and offset of the constant buffers looked at this frame
-};
-thread_local DitherThreadCache t_dither;
-
-uint64_t Mix64(uint64_t x) {  // splitmix64's finalizer
-  x ^= x >> 30;
-  x *= 0xbf58476d1ce4e5b9ull;
-  x ^= x >> 27;
-  x *= 0x94d049bb133111ebull;
-  return x ^ (x >> 31);
-}
-
-// The random index of a frame, the same for every copy.
-float DitherIndex(uint64_t frame, float count) {
-  return static_cast<float>(Mix64(frame) % static_cast<uint64_t>(count));
-}
-
-void RandomizeDither(device* dev, const buffer_range& range) {
-  if (range.buffer == 0) return;
-  const uint64_t frame = g_frame.load(std::memory_order_relaxed);
-  if (t_dither.frame != frame) {
-    t_dither.frame = frame;
-    t_dither.keys.clear();
-  }
-  if (!t_dither.keys.insert(range.buffer.handle ^ (range.offset * 0x9E3779B97F4A7C15ull)).second) return;
-  if (g_dither_checked.fetch_add(1, std::memory_order_relaxed) >= kMaxDitherChecks) return;
-  LARGE_INTEGER t0, t1;
-  QueryPerformanceCounter(&t0);
-  uint8_t* base = nullptr;
-  uint64_t size = 0;
-  {
-    std::lock_guard lock(g_dither_mutex);
-    auto it = g_dither_mapped.find(range.buffer.handle);
-    if (it == g_dither_mapped.end()) {
-      const resource_desc desc = dev->get_resource_desc(range.buffer);
-      void* mapped = nullptr;
-      if (desc.type == resource_type::buffer && desc.heap == memory_heap::upload &&
-          dev->map_buffer_region(range.buffer, 0, desc.buffer.size, map_access::read_write, &mapped) && mapped != nullptr)
-        it = g_dither_mapped.emplace(range.buffer.handle, std::make_pair(static_cast<uint8_t*>(mapped), desc.buffer.size)).first;
-      else
-        it = g_dither_mapped.emplace(range.buffer.handle, std::make_pair(nullptr, uint64_t{0})).first;
-    }
-    base = it->second.first;
-    size = it->second.second;
-  }
-  if (base != nullptr && range.offset + kTemporalAAParams + 16 <= size) {
-    uint8_t* const view = base + range.offset;
-    float dims[4], params[4];
-    std::memcpy(dims, view + kViewSizeAndInvSize, sizeof(dims));
-    std::memcpy(params, view + kTemporalAAParams, sizeof(params));
-    const float width = static_cast<float>(g_render_width.load()), height = static_cast<float>(g_render_height.load());
-    if (dims[0] == width && dims[1] == height && std::fabs(dims[0] * dims[2] - 1.0f) < 1e-3f &&
-        std::fabs(dims[1] * dims[3] - 1.0f) < 1e-3f && params[1] >= 2.0f && params[1] <= 256.0f && params[0] >= 0.0f &&
-        params[0] < params[1] && params[0] == std::floor(params[0])) {
-      const float index = DitherIndex(frame, params[1]);
-      std::memcpy(view + kTemporalAAParams, &index, sizeof(index));
-      g_dither_copies.fetch_add(1, std::memory_order_relaxed);
-      if (g_dither_frame.exchange(frame) != frame) {
-        g_dither_from = params[0];
-        g_dither_to = index;
-        g_dither_count = params[1];
-        if (++g_dither_frames == 1) {
-          char text[160];
-          std::snprintf(text, sizeof(text),
-                        "Dither: the engine's sample index for dithered materials is random from here on (frame %llu: "
-                        "%.0f of %.0f became %.0f).",
-                        static_cast<unsigned long long>(frame), params[0], params[1], index);
-          Log(reshade::log::level::info, text);
-        }
-      }
-    }
-  }
-  QueryPerformanceCounter(&t1);
-  g_dither_ticks.fetch_add(t1.QuadPart - t0.QuadPart, std::memory_order_relaxed);
-}
-
-// At the present: the finished frame's numbers, and a log line now and then.
-void DitherPresent(uint64_t frame) {
-  static LARGE_INTEGER frequency = {};
-  if (frequency.QuadPart == 0) QueryPerformanceFrequency(&frequency);
-  const uint32_t checked = g_dither_checked.exchange(0), copies = g_dither_copies.exchange(0);
-  const float ms = static_cast<float>(1000.0 * g_dither_ticks.exchange(0) / frequency.QuadPart);
-  g_dither_last_checked = checked;
-  g_dither_last_copies = copies;
-  g_dither_last_ms = ms;
-  if (g_dither_active.load() && frame % 1200 == 0) {
-    char text[200];
-    std::snprintf(text, sizeof(text),
-                  "Dither: frame %llu: %u copies of the view constants given index %.0f (of %.0f) instead of %.0f; "
-                  "%u constant buffers looked at in %.3f ms.",
-                  static_cast<unsigned long long>(frame), copies, g_dither_to.load(), g_dither_count.load(),
-                  g_dither_from.load(), checked, ms);
-    Log(reshade::log::level::info, text);
-  }
-}
-
 void OnPushDescriptors(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t param,
                        const descriptor_table_update& update) {
-  if (g_dither_active.load(std::memory_order_relaxed) && update.type == descriptor_type::constant_buffer &&
-      update.descriptors != nullptr) {
-    for (uint32_t i = 0; i < update.count; ++i)
-      RandomizeDither(cmd_list->get_device(), static_cast<const buffer_range*>(update.descriptors)[i]);
-  }
   if ((stages & shader_stage::compute) == 0 || update.type != descriptor_type::constant_buffer || update.count != 1 ||
       update.descriptors == nullptr)
     return;
@@ -1025,14 +897,6 @@ resource_view GameView(device* dev, resource res, format fmt) {
 }
 
 void OnDestroyResource(device* dev, resource res) {
-  {
-    std::lock_guard lock(g_dither_mutex);
-    const auto it = g_dither_mapped.find(res.handle);
-    if (it != g_dither_mapped.end()) {
-      if (it->second.first != nullptr) dev->unmap_buffer_region(res);
-      g_dither_mapped.erase(it);
-    }
-  }
   std::lock_guard lock(g_view_mutex);
   const auto it = g_views.find(res.handle);
   if (it == g_views.end()) return;
@@ -1247,21 +1111,17 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     }
     return false;
   }
-  // Whether the passes of this frame saw the random dither index (the TAA reads the last copy of the View constants).
-  const bool random_seen = g_dither_frame.load() == frame && c.taa_params[1] >= 2.0f &&
-                           c.taa_params[0] == DitherIndex(frame, c.taa_params[1]);
   if (g_config.dev_dumps && g_dev_frames_left.load() > 0) {
     const int32_t* const samples = g_taa_samples.load();
     char json[448];
     std::snprintf(json, sizeof(json),
                   "{\"frame\": %llu, \"dispatch\": %llu, \"render\": [%u, %u], \"input\": [%u, %u], \"output\": [%u, %u], "
                   "\"jitter\": [%.6f, %.6f], \"pre_exposure\": %.6g, \"phases\": %d, \"reset\": %d, \"mode\": %d, "
-                  "\"preset\": %d, \"taa_params\": [%.0f, %.0f, %.4f, %.4f], \"dither_random\": %d}",
+                  "\"preset\": %d, \"taa_params\": [%.0f, %.0f, %.4f, %.4f], \"ssao_off\": %d}",
                   static_cast<unsigned long long>(frame), static_cast<unsigned long long>(dispatch), render_width,
                   render_height, in_width, in_height, width, height, jitter_x, jitter_y, c.pre_exposure,
                   samples != nullptr ? samples[1] : -1, in.reset ? 1 : 0, g_config.mode, g_config.preset,
-                  c.taa_params[0], c.taa_params[1], c.taa_params[2], c.taa_params[3],
-                  random_seen ? 1 : 0);
+                  c.taa_params[0], c.taa_params[1], c.taa_params[2], c.taa_params[3], g_dev_no_ssao.load() ? 1 : 0);
     DevDumpFrame(cmd_list, color, render_width, render_height, output, width, height, json);
   }
   g_last_dlss_frame = frame;
@@ -1276,12 +1136,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     char text[320];
     std::snprintf(text, sizeof(text),
                   "DLSS frame %llu (TAA dispatch %llu): %ux%u to %ux%u, jitter %+.3f %+.3f px, %d jitter phases, "
-                  "corner jitter frames %llu, dither index %.0f of %.0f (%s), pre-exposure %.3g, camera cut %d, "
+                  "corner jitter frames %llu, TAA sample index %.0f of %.0f, pre-exposure %.3g, camera cut %d, "
                   "reset %d, failures %llu",
                   static_cast<unsigned long long>(frames), static_cast<unsigned long long>(dispatch), render_width,
                   render_height, width, height, jitter_x, jitter_y, samples != nullptr ? samples[1] : -1,
                   static_cast<unsigned long long>(g_corner_jitter_frames.load()), c.taa_params[0], c.taa_params[1],
-                  random_seen ? "random" : "the game's", c.pre_exposure,
+                  c.pre_exposure,
                   c.camera_cut ? 1 : 0, in.reset ? 1 : 0, static_cast<unsigned long long>(g_failures.load()));
     Log(reshade::log::level::info, text);
   }
@@ -1479,6 +1339,8 @@ void StartNvidia(ID3D12Device* device) {
   }
   if (max_fps != nullptr) g_max_fps.Found(max_fps);
   if (sync != nullptr) g_sync_interval.Found(sync);
+  if (int32_t* const ao = p3rdlss::FindIntConsoleVariable(L"r.AmbientOcclusionLevels", &g_ao_levels.detail))
+    g_ao_levels.Found(ao);
   {
     float* percent = p3rdlss::FindFloatConsoleVariable(L"r.ScreenPercentage", &g_screen_percentage.detail);
     const auto is_percent = [](float v) { return std::isfinite(v) && v >= 1.0f && v <= 400.0f; };
@@ -1547,6 +1409,7 @@ void OnDestroyDevice(device* dev) {
   g_max_fps.Restore();
   g_sync_interval.Restore();
   g_screen_percentage.Restore();
+  g_ao_levels.Restore();
   if (g_reflex_ready.exchange(false)) g_reflex.Configure(false, 0);
   if (float* const bias = g_mip_bias_offset.exchange(nullptr)) {
     bias[0] = g_mip_bias_game[0];
@@ -1592,6 +1455,7 @@ bool KeyPressed(int vk) {
 
 // The engine's settings DLSS wants while it runs, the game's otherwise.
 void ApplyEngineVariables() {
+  g_ao_levels.Apply(g_dev_no_ssao.load(), 0);
   const bool dlss = g_config.enabled && g_dlss_available;
   // The jitter phases. The game's own changes of the variable land in [0] first, so [0] keeps its value; the jitter
   // reads [1]. Below 100% the upsampling path multiplies them by 1 / scale^2, and this game keeps the sample index in
@@ -1674,9 +1538,6 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
     Log(reshade::log::level::info, g_config.enabled ? "DLSS on." : "DLSS off (game TAA).");
   }
   ApplyEngineVariables();
-  g_dither_active = g_config.random_dither && g_config.enabled && g_dlss_available &&
-                    g_last_dlss_frame.load() + 2 >= frame;
-  DitherPresent(frame);
 
   if (g_recreate.load() && g_nvidia_ready) {
     queue->wait_idle();
@@ -1761,10 +1622,6 @@ void OnOverlay(effect_runtime*) {
                         "textures shimmer or show moire in motion, move it toward 0. The game's own TAA path uses 0.");
   if (ImGui::Checkbox("Game exposure", &g_config.game_exposure)) SaveConfig();
   ImGui::SetItemTooltip("Give DLSS the game's eye adaptation exposure. Off lets DLSS estimate one.");
-  if (ImGui::Checkbox("Random dither", &g_config.random_dither)) SaveConfig();
-  ImGui::SetItemTooltip("The game dithers some materials (a fine dot pattern on skin) and changes the pattern in step "
-                        "with the camera jitter, so DLSS keeps it as a grid. On: while DLSS runs, the dither gets a "
-                        "random step each frame and DLSS averages it out, as the game's TAA does. Off: the game's.");
 
   ImGui::Separator();
   if (ImGui::Checkbox("NVIDIA Reflex low latency", &g_config.reflex)) SaveConfig();
@@ -1799,14 +1656,6 @@ void OnOverlay(effect_runtime*) {
       } else {
         ImGui::Text("Camera jitter: %d phases (the game asks for %d)", samples[1], samples[0]);
       }
-    if (g_dither_frame.load() + 2 >= g_frame.load())
-      ImGui::Text("Dither: random (index %.0f instead of %.0f, of %.0f) in %u copies; %u looked at, %.3f ms",
-                  g_dither_to.load(), g_dither_from.load(), g_dither_count.load(), g_dither_last_copies.load(),
-                  g_dither_last_checked.load(), g_dither_last_ms.load());
-    else if (g_dither_active.load())
-      ImGui::TextUnformatted("Dither: the game's (the view's constants were not found this frame)");
-    else
-      ImGui::TextUnformatted("Dither: the game's");
     } else
       ImGui::TextWrapped("Camera jitter: the game's (r.TemporalAASamples not found: %s)", g_jitter_detail.c_str());
     if (const int32_t* const upsampling = g_taa_upsampling.load())
@@ -1844,6 +1693,18 @@ void OnOverlay(effect_runtime*) {
   else if (g_config.enabled)
     ImGui::TextUnformatted("Not running this frame (the game's TAA runs).");
   if (g_failures.load() != 0) ImGui::Text("Failed evaluations: %llu", static_cast<unsigned long long>(g_failures.load()));
+  if (g_config.dev_dumps) {
+    ImGui::Separator();
+    bool no_ssao = g_dev_no_ssao.load();
+    if (ImGui::Checkbox("Development: SSAO off (r.AmbientOcclusionLevels 0)", &no_ssao)) {
+      g_dev_no_ssao = no_ssao;
+      Log(reshade::log::level::info, no_ssao ? "Development: SSAO off." : "Development: SSAO back to the game's.");
+    }
+    if (g_ao_levels.values.load() != nullptr)
+      ImGui::Text("r.AmbientOcclusionLevels: the game's %d, now %d", g_ao_levels.game[1], g_ao_levels.values.load()[1]);
+    else
+      ImGui::TextWrapped("r.AmbientOcclusionLevels not found: %s", g_ao_levels.detail.c_str());
+  }
   if (g_corner_jitter_frames.load() != 0)
     ImGui::TextWrapped("Jitter stuck at the pixel's corner in %llu frames (the engine's sample index wrapped: more "
                        "than 128 phases).",
