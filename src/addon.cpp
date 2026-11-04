@@ -123,7 +123,7 @@ struct __declspec(uuid("6d2f8a41-93c7-4e5b-a0d6-1f4b7c9e2a58")) CmdData {
   // `cbv_layout`, by root parameter. The descriptor tracking only covers descriptor tables.
   pipeline_layout cbv_layout = {0};
   std::vector<buffer_range> cbvs;
-  // Development (DevDumps=1): the same for the graphics root signature, for the pass trace.
+  // The same for the graphics root signature (the SSAO pass's constants; the development pass trace).
   pipeline_layout gfx_cbv_layout = {0};
   std::vector<buffer_range> gfx_cbvs;
 };
@@ -159,6 +159,8 @@ struct Config {
   bool log_taa_passes = false;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
+  // While DLSS runs, SSAO's noise gets a random one of its 8 steps each frame instead of the jitter's (SSAO below).
+  bool ssao_noise_fix = true;
   // Development: frame and shader dumps for offline analysis (DevDump below), read at load.
   bool dev_dumps = false;
 };
@@ -363,6 +365,7 @@ void LoadConfig() {
   if (g_config.render_scale != 0.0f) g_config.render_scale = std::clamp(g_config.render_scale, 0.33f, 1.0f);
   g_config.log_taa_passes = ReadInt(L"LogTaaPasses", 0) != 0;
   g_config.dev_dumps = ReadInt(L"DevDumps", 0) != 0;
+  g_config.ssao_noise_fix = ReadInt(L"SsaoNoiseFix", 1) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -379,6 +382,7 @@ void SaveConfig() {
   WriteInt(L"Mode", g_config.mode);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
+  WriteInt(L"SsaoNoiseFix", g_config.ssao_noise_fix);
 }
 
 void SetDlssEnabled(bool enabled) {
@@ -570,10 +574,125 @@ void DevDumpFrame(command_list* cmd, resource color, uint32_t render_width, uint
   g_dev_pending.push_back(std::move(frame));
 }
 
+bool ReadBuffer(device* dev, const buffer_range& range, uint32_t offset, uint32_t size, void* out);  // below
+
+// --- SSAO's noise, unlocked from the camera jitter -------------------------------------------------------------
+
+// Unreal's SSAO rotates its samples with a 4x4 noise texture that it shifts every frame by TemporalOffset =
+// (TAA sample index % 8) * (2.48, 7.52) / 64 (ScreenSpaceAOParams[3].xy: this game's SSAO pixel shader reads it from
+// row 30 of its $Globals, next to the inverse tangent of half the field of view in .w; the vertex shader's copy is at
+// row 14). The sample index also picks the camera jitter, so every jitter position always meets the same noise step:
+// the game's TAA blurs the steps together, DLSS puts each frame's samples at their jitter positions and keeps the
+// noise as a fine 4x4 grid on skin and in corners (Junpei's cheek; docs/recon.md). While DLSS runs, the SSAO pass (the
+// frame's full-screen draw into an R8 target at the render size) gets a random one of the same 8 steps each frame, in
+// every constant buffer bound for it that holds the offset; the step's rows are remembered per pipeline for the frames
+// whose step is 0 (an offset of 0 cannot be told from other zeros).
+constexpr float kAoStepX = 2.48f / 64.0f, kAoStepY = 7.52f / 64.0f;
+constexpr uint32_t kAoRows = 48;  // rows of each constant buffer looked at
+std::atomic<uint64_t> g_ao_frames{0};      // frames whose SSAO step the add-on chose
+std::atomic<uint64_t> g_ao_last_frame{0};
+std::atomic<int> g_ao_from{-1}, g_ao_to{-1};
+std::atomic<uint32_t> g_ao_rows{0};        // copies of the offset changed in the last such frame
+std::mutex g_ao_mutex;
+std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> g_ao_locations;  // pipeline -> (root param, row)
+
+uint64_t Mix64(uint64_t x) {  // splitmix64's finalizer
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ull;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+
+// A row (x, y, z, w) holding the SSAO offset at step 1 to 7: (k * 2.48 / 64, k * 7.52 / 64, ..., 1 / tan(fov / 2)).
+bool AoOffsetRow(const float* row, int* step) {
+  if (!(row[3] > 0.2f && row[3] < 10.0f)) return false;
+  const float kx = row[0] / kAoStepX, ky = row[1] / kAoStepY;
+  const long k = std::lround(kx);
+  if (k < 1 || k > 7 || std::fabs(kx - static_cast<float>(k)) > 1e-3f || std::fabs(ky - static_cast<float>(k)) > 1e-3f)
+    return false;
+  *step = static_cast<int>(k);
+  return true;
+}
+
+void RandomizeSsaoNoise(command_list* cmd, const CmdData& data) {
+  device* const dev = cmd->get_device();
+  const uint64_t frame = g_frame.load();
+  std::vector<std::pair<uint32_t, uint32_t>> found;
+  int from = 0;
+  for (uint32_t param = 0; param < data.gfx_cbvs.size(); ++param) {
+    if (data.gfx_cbvs[param].buffer == 0) continue;
+    float rows[kAoRows * 4];
+    uint32_t count = kAoRows;
+    while (count >= 16 && !ReadBuffer(dev, data.gfx_cbvs[param], 0, count * 16, rows)) count /= 2;
+    if (count < 16) continue;
+    for (uint32_t r = 0; r < count; ++r) {
+      int step = 0;
+      if (AoOffsetRow(rows + 4 * r, &step)) {
+        found.emplace_back(param, r);
+        from = step;
+      }
+    }
+  }
+  {
+    std::lock_guard lock(g_ao_mutex);
+    if (!found.empty())
+      g_ao_locations[data.current.handle] = found;
+    else if (const auto it = g_ao_locations.find(data.current.handle); it != g_ao_locations.end())
+      found = it->second;  // step 0 this frame
+  }
+  if (found.empty()) return;
+  const int to = static_cast<int>(Mix64(frame * 0x9E3779B97F4A7C15ull) % 8);
+  const float offset[2] = {to * kAoStepX, to * kAoStepY};
+  uint32_t written = 0;
+  for (const auto& [param, r] : found) {
+    if (param >= data.gfx_cbvs.size() || data.gfx_cbvs[param].buffer == 0) continue;
+    const buffer_range& range = data.gfx_cbvs[param];
+    const resource_desc desc = dev->get_resource_desc(range.buffer);
+    if (desc.type != resource_type::buffer || desc.heap != memory_heap::upload ||
+        range.offset + r * 16 + sizeof(offset) > desc.buffer.size)
+      continue;
+    void* mapped = nullptr;
+    if (dev->map_buffer_region(range.buffer, range.offset + r * 16, sizeof(offset), map_access::write_only, &mapped) &&
+        mapped != nullptr) {
+      std::memcpy(mapped, offset, sizeof(offset));
+      dev->unmap_buffer_region(range.buffer);
+      ++written;
+    }
+  }
+  g_ao_from = from;
+  g_ao_to = to;
+  g_ao_rows = written;
+  g_ao_last_frame = frame;
+  if (written != 0 && ++g_ao_frames == 1) {
+    char text[200];
+    std::snprintf(text, sizeof(text),
+                  "SSAO: its noise gets a random step from here on (frame %llu: step %d became %d in %u constant "
+                  "buffer row(s)).",
+                  static_cast<unsigned long long>(frame), from, to, written);
+    Log(reshade::log::level::info, text);
+  }
+}
+
+// The SSAO pass: a full-screen triangle into one R8 target at DLSS's render size, while DLSS runs.
+void SsaoDraw(command_list* cmd, uint32_t vertices, uint32_t instances) {
+  if (!g_config.ssao_noise_fix || !g_config.enabled || vertices != 3 || instances != 1 ||
+      g_last_dlss_frame.load() + 2 < g_frame.load())
+    return;
+  auto* const state = cmd->get_private_data<state_tracking>();
+  auto* const data = cmd->get_private_data<CmdData>();
+  if (state == nullptr || data == nullptr || state->render_targets.size() != 1 || state->render_targets[0] == 0) return;
+  device* const dev = cmd->get_device();
+  const format f = dev->get_resource_view_desc(state->render_targets[0]).format;
+  if (f != format::r8_unorm && f != format::r8_typeless) return;
+  const resource_desc desc = dev->get_resource_desc(dev->get_resource_from_view(state->render_targets[0]));
+  if (desc.texture.width != g_render_width.load() || desc.texture.height != g_render_height.load()) return;
+  RandomizeSsaoNoise(cmd, *data);
+}
+
 // A trace of one frame's passes (dev\trace.txt arms it for the next frame; dev\trace_<frame>.txt): every draw and
 // dispatch with its pipeline's shaders, render targets (format, size) and root constant buffers; for dispatches and
 // full-screen draws (at most 4 vertices, one instance) also the first 16 rows of each constant buffer, as floats.
-bool ReadBuffer(device* dev, const buffer_range& range, uint32_t offset, uint32_t size, void* out);  // below
 std::atomic<uint64_t> g_trace_frame{0};
 std::atomic<uint64_t> g_trace_seq{0};
 std::mutex g_trace_mutex;
@@ -630,6 +749,7 @@ void DevTrace(command_list* cmd, bool dispatch, uint32_t a, uint32_t b, uint32_t
 }
 
 bool OnDevDraw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
+  SsaoDraw(cmd, vertices, instances);
   if (g_config.dev_dumps) DevTrace(cmd, false, vertices, instances, 0);
   return false;
 }
@@ -776,7 +896,7 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
 
 void OnPushDescriptors(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t param,
                        const descriptor_table_update& update) {
-  if (g_config.dev_dumps && (stages & shader_stage::all_graphics) != 0 &&
+  if ((stages & shader_stage::all_graphics) != 0 &&
       update.type == descriptor_type::constant_buffer && update.count == 1 && update.descriptors != nullptr) {
     if (auto* const data = cmd_list->get_private_data<CmdData>()) {
       if (data->gfx_cbv_layout != layout) {
@@ -1737,6 +1857,10 @@ void OnOverlay(effect_runtime*) {
                         "textures shimmer or show moire in motion, move it toward 0. The game's own TAA path uses 0.");
   if (ImGui::Checkbox("Game exposure", &g_config.game_exposure)) SaveConfig();
   ImGui::SetItemTooltip("Give DLSS the game's eye adaptation exposure. Off lets DLSS estimate one.");
+  if (ImGui::Checkbox("Smooth SSAO noise", &g_config.ssao_noise_fix)) SaveConfig();
+  ImGui::SetItemTooltip("The game's ambient occlusion steps its 4x4 noise pattern in time with the camera jitter, so "
+                        "DLSS keeps it as a fine grid (on skin, in corners). On: while DLSS runs, the noise takes a "
+                        "random one of its 8 steps each frame and DLSS averages it out, as the game's TAA does.");
 
   ImGui::Separator();
   if (ImGui::Checkbox("NVIDIA Reflex low latency", &g_config.reflex)) SaveConfig();
@@ -1808,6 +1932,13 @@ void OnOverlay(effect_runtime*) {
   else if (g_config.enabled)
     ImGui::TextUnformatted("Not running this frame (the game's TAA runs).");
   if (g_failures.load() != 0) ImGui::Text("Failed evaluations: %llu", static_cast<unsigned long long>(g_failures.load()));
+  if (g_config.ssao_noise_fix) {
+    if (g_ao_last_frame.load() + 2 >= g_frame.load())
+      ImGui::Text("SSAO noise: step %d (the game's: %d), %u constant buffer row(s)", g_ao_to.load(), g_ao_from.load(),
+                  g_ao_rows.load());
+    else
+      ImGui::TextUnformatted("SSAO noise: the SSAO pass was not seen this frame");
+  }
   if (g_config.dev_dumps) {
     ImGui::Separator();
     bool no_ssao = g_dev_no_ssao.load();
