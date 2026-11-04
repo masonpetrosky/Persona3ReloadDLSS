@@ -104,7 +104,10 @@ Expected obstacles:
    noise on, the offset row named once, no warnings, 21,000 DLSS frames. The user also pointed at a smudge under
    Junpei's sideburn tip and beaded edges on a stroller's thin tubes: both are the same with the game's noise, details
    under a rendered pixel at Performance's 50%; the user checked Quality and DLAA: "just because of the heavy
-   upscaling. That's fine." Next: a release (0.1.1), after anything else the user wants to look at.
+   upscaling. That's fine."
+   Released 2026-11-03 with the user's OK: GitHub release v0.1.1 (both zips; the HUD fix's only carries the new
+   version) and on Nexus the 0.1.1 zip as the update of the main file (0.1.0 archived), mod version 0.1.1, three
+   changelog lines, and in the description a bullet, a changelog line and a sentence in "How it works".
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
 
