@@ -99,7 +99,8 @@ Expected obstacles:
    default on) fills the game's noise texture with spatiotemporal blue noise every frame and sets the offset to 0.
    In game 2026-11-03 (test build 8fcaf886): the texture found and read back as Unreal's tile, the lattice gone from the
    SSAO output, irregular grain in its place on the cheek; the user: "looks good". Then cleaned up (one setting, the
-   offset written only in the pixel shader's row 30); to install and check in the log, then a release.
+   offset written only in the pixel shader's row 30): 5bc6a81, installed 2026-11-03 22:07 (the user's ini without the
+   development lines). Its log to check at the next start, then a release.
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
 
