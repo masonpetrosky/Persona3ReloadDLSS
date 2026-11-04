@@ -123,6 +123,9 @@ struct __declspec(uuid("6d2f8a41-93c7-4e5b-a0d6-1f4b7c9e2a58")) CmdData {
   // `cbv_layout`, by root parameter. The descriptor tracking only covers descriptor tables.
   pipeline_layout cbv_layout = {0};
   std::vector<buffer_range> cbvs;
+  // Development (DevDumps=1): the same for the graphics root signature, for the pass trace.
+  pipeline_layout gfx_cbv_layout = {0};
+  std::vector<buffer_range> gfx_cbvs;
 };
 
 // --- Settings (Persona3ReloadDLSS.ini next to the add-on) ------------------------------------------------------
@@ -512,7 +515,9 @@ FILE* DevOpen(const fs::path& path, const wchar_t* mode) {
   return _wfopen_s(&file, path.c_str(), mode) == 0 ? file : nullptr;
 }
 
-void DevDumpShaders(uint32_t count, const pipeline_subobject* subobjects) {
+std::unordered_map<uint64_t, std::string> g_dev_pipeline_shaders;  // pipeline -> "ps_<digest>" / "cs_<digest>"
+
+void DevDumpShaders(uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
   for (uint32_t i = 0; i < count; ++i) {
     const char* const stage = subobjects[i].type == pipeline_subobject_type::pixel_shader     ? "ps"
                               : subobjects[i].type == pipeline_subobject_type::compute_shader ? "cs"
@@ -524,6 +529,8 @@ void DevDumpShaders(uint32_t count, const pipeline_subobject* subobjects) {
     const std::string name = std::string(stage) + "_" + Hex(digest) + ".dxil";
     {
       std::lock_guard lock(g_dev_mutex);
+      std::string& shaders = g_dev_pipeline_shaders[p.handle];
+      shaders += (shaders.empty() ? "" : ",") + name.substr(0, name.size() - 5);
       if (!g_dev_shaders.insert(name).second) continue;
     }
     if (FILE* const f = DevOpen(g_dev_dir / L"shaders" / name, L"wb")) {
@@ -563,8 +570,104 @@ void DevDumpFrame(command_list* cmd, resource color, uint32_t render_width, uint
   g_dev_pending.push_back(std::move(frame));
 }
 
+// A trace of one frame's passes (dev\trace.txt arms it for the next frame; dev\trace_<frame>.txt): every draw and
+// dispatch with its pipeline's shaders, render targets (format, size) and root constant buffers; for dispatches and
+// full-screen draws (at most 4 vertices, one instance) also the first 16 rows of each constant buffer, as floats.
+bool ReadBuffer(device* dev, const buffer_range& range, uint32_t offset, uint32_t size, void* out);  // below
+std::atomic<uint64_t> g_trace_frame{0};
+std::atomic<uint64_t> g_trace_seq{0};
+std::mutex g_trace_mutex;
+std::vector<std::pair<uint64_t, std::string>> g_trace_lines;
+
+void DevTrace(command_list* cmd, bool dispatch, uint32_t a, uint32_t b, uint32_t c) {
+  if (g_trace_frame.load(std::memory_order_relaxed) != g_frame.load(std::memory_order_relaxed)) return;
+  device* const dev = cmd->get_device();
+  auto* const data = cmd->get_private_data<CmdData>();
+  auto* const state = cmd->get_private_data<state_tracking>();
+  if (data == nullptr) return;
+  const uint64_t seq = g_trace_seq++;
+  char head[96];
+  std::snprintf(head, sizeof(head), "%llu t%lu %s %u %u %u", static_cast<unsigned long long>(seq), GetCurrentThreadId(),
+                dispatch ? "dispatch" : "draw", a, b, c);
+  std::string line = head;
+  {
+    std::lock_guard lock(g_dev_mutex);
+    const auto it = g_dev_pipeline_shaders.find(data->current.handle);
+    line += " " + (it != g_dev_pipeline_shaders.end() ? it->second : std::string("?"));
+  }
+  if (!dispatch && state != nullptr) {
+    for (const resource_view rtv : state->render_targets) {
+      if (rtv == 0) continue;
+      const resource res = dev->get_resource_from_view(rtv);
+      const resource_desc desc = dev->get_resource_desc(res);
+      char rt[64];
+      std::snprintf(rt, sizeof(rt), " rt=%d:%ux%u", static_cast<int>(dev->get_resource_view_desc(rtv).format),
+                    desc.texture.width, desc.texture.height);
+      line += rt;
+    }
+  }
+  const bool contents = dispatch || (a <= 4 && b == 1);
+  const std::vector<buffer_range>& cbvs = dispatch ? data->cbvs : data->gfx_cbvs;
+  for (size_t i = 0; i < cbvs.size(); ++i) {
+    if (cbvs[i].buffer == 0) continue;
+    char cb[64];
+    std::snprintf(cb, sizeof(cb), " cb%zu=%llx+%llu", i, static_cast<unsigned long long>(cbvs[i].buffer.handle),
+                  static_cast<unsigned long long>(cbvs[i].offset));
+    line += cb;
+    float rows[64];
+    if (contents && ReadBuffer(dev, cbvs[i], 0, sizeof(rows), rows)) {
+      line += "[";
+      for (int k = 0; k < 64; ++k) {
+        char v[24];
+        std::snprintf(v, sizeof(v), k == 0 ? "%.6g" : " %.6g", rows[k]);
+        line += v;
+      }
+      line += "]";
+    }
+  }
+  std::lock_guard lock(g_trace_mutex);
+  g_trace_lines.emplace_back(seq, std::move(line));
+}
+
+bool OnDevDraw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
+  if (g_config.dev_dumps) DevTrace(cmd, false, vertices, instances, 0);
+  return false;
+}
+bool OnDevDrawIndexed(command_list* cmd, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
+  if (g_config.dev_dumps) DevTrace(cmd, false, indices, instances, 1);
+  return false;
+}
+
 // At the present: arms a dump when the trigger file appears, and writes the dumps whose frames the GPU has finished.
 void DevDumpPresent(command_queue* queue, uint64_t frame) {
+  if (g_trace_frame.load() != 0 && g_trace_frame.load() < frame) {  // the traced frame has ended
+    std::vector<std::pair<uint64_t, std::string>> lines;
+    {
+      std::lock_guard lock(g_trace_mutex);
+      lines.swap(g_trace_lines);
+    }
+    std::sort(lines.begin(), lines.end());
+    char name[48];
+    std::snprintf(name, sizeof(name), "trace_%06llu.txt", static_cast<unsigned long long>(g_trace_frame.load()));
+    if (FILE* const out = DevOpen(g_dev_dir / name, L"wb")) {
+      for (const auto& [seq, line] : lines) {
+        std::fputs(line.c_str(), out);
+        std::fputc('\n', out);
+      }
+      std::fclose(out);
+    }
+    Log(reshade::log::level::info, "Development: traced frame " + std::to_string(g_trace_frame.load()) + ": " +
+                                       std::to_string(lines.size()) + " draws and dispatches.");
+    g_trace_frame = 0;
+  }
+  if (frame % 30 == 15) {
+    std::error_code error;
+    if (fs::exists(g_dev_dir / L"trace.txt", error)) {
+      fs::remove(g_dev_dir / L"trace.txt", error);
+      g_trace_seq = 0;
+      g_trace_frame = frame;  // the frame that starts now
+    }
+  }
   if (frame % 30 == 0) {
     const fs::path trigger = g_dev_dir / L"dump.txt";
     std::error_code error;
@@ -621,7 +724,7 @@ void DevDumpPresent(command_queue* queue, uint64_t frame) {
 }
 
 void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
-  if (g_config.dev_dumps) DevDumpShaders(count, subobjects);
+  if (g_config.dev_dumps) DevDumpShaders(count, subobjects, p);
   for (uint32_t i = 0; i < count; ++i) {
     if (subobjects[i].type != pipeline_subobject_type::compute_shader) continue;
     const auto* const cs = static_cast<const shader_desc*>(subobjects[i].data);
@@ -673,6 +776,17 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
 
 void OnPushDescriptors(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t param,
                        const descriptor_table_update& update) {
+  if (g_config.dev_dumps && (stages & shader_stage::all_graphics) != 0 &&
+      update.type == descriptor_type::constant_buffer && update.count == 1 && update.descriptors != nullptr) {
+    if (auto* const data = cmd_list->get_private_data<CmdData>()) {
+      if (data->gfx_cbv_layout != layout) {
+        data->gfx_cbv_layout = layout;
+        data->gfx_cbvs.clear();
+      }
+      if (param >= data->gfx_cbvs.size()) data->gfx_cbvs.resize(param + 1);
+      data->gfx_cbvs[param] = static_cast<const buffer_range*>(update.descriptors)[0];
+    }
+  }
   if ((stages & shader_stage::compute) == 0 || update.type != descriptor_type::constant_buffer || update.count != 1 ||
       update.descriptors == nullptr)
     return;
@@ -1252,6 +1366,7 @@ void LogTaaPass(command_list* cmd_list, const CmdData& data, uint32_t gx, uint32
 bool OnDispatch(command_list* cmd_list, uint32_t gx, uint32_t gy, uint32_t gz) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
+  if (g_config.dev_dumps) DevTrace(cmd_list, true, gx, gy, gz);
   if (data->taa_like) LogTaaPass(cmd_list, *data, gx, gy, gz);
   if (data->taa == kNotTaa) return false;
   if (!ReplaceTaa(cmd_list, *data)) return false;
@@ -1763,6 +1878,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::register_event<reshade::addon_event::draw>(OnDevDraw);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnDevDrawIndexed);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       // Reflex: the present markers after every other present callback, right before the swap chain presents; the
