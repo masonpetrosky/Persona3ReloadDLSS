@@ -49,6 +49,8 @@ endfunction()
 shader(kMotionVectorsCs motion_vectors.hlsl cs_5_0 main)
 
 configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
+set_source_files_properties(${CMAKE_BINARY_DIR}/version.rc PROPERTIES OBJECT_DEPENDS
+                            ${CMAKE_SOURCE_DIR}/src/stbn_64x64x64.bin)
 
 add_library(Persona3ReloadDLSS SHARED src/addon.cpp src/console_variables.cpp src/descriptors.cpp src/dlss.cpp
             src/reflex.cpp ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})

@@ -16,6 +16,7 @@
 #include <reshade.hpp>
 
 #include <locale.h>
+#include <share.h>
 
 #include <algorithm>
 #include <array>
@@ -126,6 +127,9 @@ struct __declspec(uuid("6d2f8a41-93c7-4e5b-a0d6-1f4b7c9e2a58")) CmdData {
   // The same for the graphics root signature (the SSAO pass's constants; the development pass trace).
   pipeline_layout gfx_cbv_layout = {0};
   std::vector<buffer_range> gfx_cbvs;
+  // Development: the SSAO pass's output to copy at this list's next command (DevAoCopy), and its frame.
+  resource ao_dump = {0};
+  uint64_t ao_dump_frame = 0;
 };
 
 // --- Settings (Persona3ReloadDLSS.ini next to the add-on) ------------------------------------------------------
@@ -159,8 +163,8 @@ struct Config {
   bool log_taa_passes = false;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
-  // While DLSS runs, SSAO's noise gets a random one of its 8 steps each frame instead of the jitter's (SSAO below).
-  bool ssao_noise_fix = true;
+  // While DLSS runs, SSAO's noise is spatiotemporal blue noise instead of the game's 4x4 tile (SSAO below).
+  std::atomic<bool> ssao_blue_noise{true};
   // Development: frame and shader dumps for offline analysis (DevDump below), read at load.
   bool dev_dumps = false;
 };
@@ -182,6 +186,7 @@ constexpr int kModeCount = static_cast<int>(std::size(kModes));
 float RenderScale() {
   return g_config.render_scale > 0.0f ? g_config.render_scale : kModes[g_config.mode].scale;
 }
+HMODULE g_module = nullptr;
 fs::path g_addon_dir;  // the game's Binaries\Win64
 fs::path g_data_dir;   // Persona3ReloadDLSS in it: nvngx_dlss.dll and NGX's logs
 fs::path g_ini_path;
@@ -365,7 +370,7 @@ void LoadConfig() {
   if (g_config.render_scale != 0.0f) g_config.render_scale = std::clamp(g_config.render_scale, 0.33f, 1.0f);
   g_config.log_taa_passes = ReadInt(L"LogTaaPasses", 0) != 0;
   g_config.dev_dumps = ReadInt(L"DevDumps", 0) != 0;
-  g_config.ssao_noise_fix = ReadInt(L"SsaoNoiseFix", 1) != 0;
+  g_config.ssao_blue_noise = ReadInt(L"SsaoBlueNoise", 1) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -382,7 +387,9 @@ void SaveConfig() {
   WriteInt(L"Mode", g_config.mode);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
-  WriteInt(L"SsaoNoiseFix", g_config.ssao_noise_fix);
+  WriteInt(L"SsaoBlueNoise", g_config.ssao_blue_noise);
+  for (const wchar_t* const test_key : {L"SsaoNoise", L"SsaoNoiseFix"})  // test builds' keys
+    WritePrivateProfileStringW(L"Persona3ReloadDLSS", test_key, nullptr, g_ini_path.c_str());
 }
 
 void SetDlssEnabled(bool enabled) {
@@ -506,6 +513,7 @@ struct DevCopy {
   uint32_t width = 0, height = 0, row_pixels = 0;
   uint64_t size = 0;
   std::string name;
+  uint32_t pixel_bytes = 8;
 };
 struct DevFrame {
   uint64_t frame = 0;
@@ -515,8 +523,7 @@ struct DevFrame {
 std::vector<DevFrame> g_dev_pending;  // copies recorded, not yet read back
 
 FILE* DevOpen(const fs::path& path, const wchar_t* mode) {
-  FILE* file = nullptr;
-  return _wfopen_s(&file, path.c_str(), mode) == 0 ? file : nullptr;
+  return _wfsopen(path.c_str(), mode, _SH_DENYNO);  // shared: tools read frames.jsonl while it grows
 }
 
 std::unordered_map<uint64_t, std::string> g_dev_pipeline_shaders;  // pipeline -> "ps_<digest>" / "cs_<digest>"
@@ -575,121 +582,8 @@ void DevDumpFrame(command_list* cmd, resource color, uint32_t render_width, uint
 }
 
 bool ReadBuffer(device* dev, const buffer_range& range, uint32_t offset, uint32_t size, void* out);  // below
-
-// --- SSAO's noise, unlocked from the camera jitter -------------------------------------------------------------
-
-// Unreal's SSAO rotates its samples with a 4x4 noise texture that it shifts every frame by TemporalOffset =
-// (TAA sample index % 8) * (2.48, 7.52) / 64 (ScreenSpaceAOParams[3].xy: this game's SSAO pixel shader reads it from
-// row 30 of its $Globals, next to the inverse tangent of half the field of view in .w; the vertex shader's copy is at
-// row 14). The sample index also picks the camera jitter, so every jitter position always meets the same noise step:
-// the game's TAA blurs the steps together, DLSS puts each frame's samples at their jitter positions and keeps the
-// noise as a fine 4x4 grid on skin and in corners (Junpei's cheek; docs/recon.md). While DLSS runs, the SSAO pass (the
-// frame's full-screen draw into an R8 target at the render size) gets a random one of the same 8 steps each frame, in
-// every constant buffer bound for it that holds the offset; the step's rows are remembered per pipeline for the frames
-// whose step is 0 (an offset of 0 cannot be told from other zeros).
-constexpr float kAoStepX = 2.48f / 64.0f, kAoStepY = 7.52f / 64.0f;
-constexpr uint32_t kAoRows = 48;  // rows of each constant buffer looked at
-std::atomic<uint64_t> g_ao_frames{0};      // frames whose SSAO step the add-on chose
-std::atomic<uint64_t> g_ao_last_frame{0};
-std::atomic<int> g_ao_from{-1}, g_ao_to{-1};
-std::atomic<uint32_t> g_ao_rows{0};        // copies of the offset changed in the last such frame
-std::mutex g_ao_mutex;
-std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> g_ao_locations;  // pipeline -> (root param, row)
-
-uint64_t Mix64(uint64_t x) {  // splitmix64's finalizer
-  x ^= x >> 30;
-  x *= 0xbf58476d1ce4e5b9ull;
-  x ^= x >> 27;
-  x *= 0x94d049bb133111ebull;
-  return x ^ (x >> 31);
-}
-
-// A row (x, y, z, w) holding the SSAO offset at step 1 to 7: (k * 2.48 / 64, k * 7.52 / 64, ..., 1 / tan(fov / 2)).
-bool AoOffsetRow(const float* row, int* step) {
-  if (!(row[3] > 0.2f && row[3] < 10.0f)) return false;
-  const float kx = row[0] / kAoStepX, ky = row[1] / kAoStepY;
-  const long k = std::lround(kx);
-  if (k < 1 || k > 7 || std::fabs(kx - static_cast<float>(k)) > 1e-3f || std::fabs(ky - static_cast<float>(k)) > 1e-3f)
-    return false;
-  *step = static_cast<int>(k);
-  return true;
-}
-
-void RandomizeSsaoNoise(command_list* cmd, const CmdData& data) {
-  device* const dev = cmd->get_device();
-  const uint64_t frame = g_frame.load();
-  std::vector<std::pair<uint32_t, uint32_t>> found;
-  int from = 0;
-  for (uint32_t param = 0; param < data.gfx_cbvs.size(); ++param) {
-    if (data.gfx_cbvs[param].buffer == 0) continue;
-    float rows[kAoRows * 4];
-    uint32_t count = kAoRows;
-    while (count >= 16 && !ReadBuffer(dev, data.gfx_cbvs[param], 0, count * 16, rows)) count /= 2;
-    if (count < 16) continue;
-    for (uint32_t r = 0; r < count; ++r) {
-      int step = 0;
-      if (AoOffsetRow(rows + 4 * r, &step)) {
-        found.emplace_back(param, r);
-        from = step;
-      }
-    }
-  }
-  {
-    std::lock_guard lock(g_ao_mutex);
-    if (!found.empty())
-      g_ao_locations[data.current.handle] = found;
-    else if (const auto it = g_ao_locations.find(data.current.handle); it != g_ao_locations.end())
-      found = it->second;  // step 0 this frame
-  }
-  if (found.empty()) return;
-  const int to = static_cast<int>(Mix64(frame * 0x9E3779B97F4A7C15ull) % 8);
-  const float offset[2] = {to * kAoStepX, to * kAoStepY};
-  uint32_t written = 0;
-  for (const auto& [param, r] : found) {
-    if (param >= data.gfx_cbvs.size() || data.gfx_cbvs[param].buffer == 0) continue;
-    const buffer_range& range = data.gfx_cbvs[param];
-    const resource_desc desc = dev->get_resource_desc(range.buffer);
-    if (desc.type != resource_type::buffer || desc.heap != memory_heap::upload ||
-        range.offset + r * 16 + sizeof(offset) > desc.buffer.size)
-      continue;
-    void* mapped = nullptr;
-    if (dev->map_buffer_region(range.buffer, range.offset + r * 16, sizeof(offset), map_access::write_only, &mapped) &&
-        mapped != nullptr) {
-      std::memcpy(mapped, offset, sizeof(offset));
-      dev->unmap_buffer_region(range.buffer);
-      ++written;
-    }
-  }
-  g_ao_from = from;
-  g_ao_to = to;
-  g_ao_rows = written;
-  g_ao_last_frame = frame;
-  if (written != 0 && ++g_ao_frames == 1) {
-    char text[200];
-    std::snprintf(text, sizeof(text),
-                  "SSAO: its noise gets a random step from here on (frame %llu: step %d became %d in %u constant "
-                  "buffer row(s)).",
-                  static_cast<unsigned long long>(frame), from, to, written);
-    Log(reshade::log::level::info, text);
-  }
-}
-
-// The SSAO pass: a full-screen triangle (3 indices, one instance) into one R8 target at DLSS's render size, while
-// DLSS runs.
-void SsaoDraw(command_list* cmd, uint32_t vertices, uint32_t instances) {
-  if (!g_config.ssao_noise_fix || !g_config.enabled || vertices != 3 || instances != 1 ||
-      g_last_dlss_frame.load() + 2 < g_frame.load())
-    return;
-  auto* const state = cmd->get_private_data<state_tracking>();
-  auto* const data = cmd->get_private_data<CmdData>();
-  if (state == nullptr || data == nullptr || state->render_targets.size() != 1 || state->render_targets[0] == 0) return;
-  device* const dev = cmd->get_device();
-  const format f = dev->get_resource_view_desc(state->render_targets[0]).format;
-  if (f != format::r8_unorm && f != format::r8_typeless) return;
-  const resource_desc desc = dev->get_resource_desc(dev->get_resource_from_view(state->render_targets[0]));
-  if (desc.texture.width != g_render_width.load() || desc.texture.height != g_render_height.load()) return;
-  RandomizeSsaoNoise(cmd, *data);
-}
+void SsaoDraw(command_list* cmd, uint32_t vertices, uint32_t instances);                       // below
+void DevAoCopy(command_list* cmd);                                                             // below
 
 // A trace of one frame's passes (dev\trace.txt arms it for the next frame; dev\trace_<frame>.txt): every draw and
 // dispatch with its pipeline's shaders, render targets (format, size) and root constant buffers; for dispatches and
@@ -750,11 +644,13 @@ void DevTrace(command_list* cmd, bool dispatch, uint32_t a, uint32_t b, uint32_t
 }
 
 bool OnDevDraw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
+  DevAoCopy(cmd);
   SsaoDraw(cmd, vertices, instances);
   if (g_config.dev_dumps) DevTrace(cmd, false, vertices, instances, 0);
   return false;
 }
 bool OnDevDrawIndexed(command_list* cmd, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
+  DevAoCopy(cmd);
   SsaoDraw(cmd, indices, instances);  // the SSAO pass is an indexed full-screen triangle
   if (g_config.dev_dumps) DevTrace(cmd, false, indices, instances, 1);
   return false;
@@ -781,6 +677,20 @@ void DevDumpPresent(command_queue* queue, uint64_t frame) {
     Log(reshade::log::level::info, "Development: traced frame " + std::to_string(g_trace_frame.load()) + ": " +
                                        std::to_string(lines.size()) + " draws and dispatches.");
     g_trace_frame = 0;
+  }
+  if (frame % 30 == 20) {  // dev\ssao.txt holding 0 or 1: SsaoBlueNoise until the next start, not saved
+    const fs::path trigger = g_dev_dir / L"ssao.txt";
+    std::error_code error;
+    if (fs::exists(trigger, error)) {
+      if (FILE* const f = DevOpen(trigger, L"rb")) {
+        char text[16] = {};
+        if (std::fgets(text, sizeof(text), f) != nullptr) g_config.ssao_blue_noise = std::atoi(text) != 0;
+        std::fclose(f);
+      }
+      fs::remove(trigger, error);
+      Log(reshade::log::level::info, std::string("Development: blue-noise SSAO ") +
+                                         (g_config.ssao_blue_noise ? "on" : "off") + " (dev\\ssao.txt).");
+    }
   }
   if (frame % 30 == 15) {
     std::error_code error;
@@ -830,13 +740,15 @@ void DevDumpPresent(command_queue* queue, uint64_t frame) {
                       c.name.c_str(), c.width, c.height);
         if (FILE* const out = DevOpen(g_dev_dir / L"frames" / name, L"wb")) {
           for (uint32_t y = 0; y < c.height; ++y)
-            std::fwrite(static_cast<const uint8_t*>(data) + size_t{y} * c.row_pixels * 8, 8, c.width, out);
+            std::fwrite(static_cast<const uint8_t*>(data) + size_t{y} * c.row_pixels * c.pixel_bytes, c.pixel_bytes,
+                        c.width, out);
           std::fclose(out);
         }
         dev->unmap_buffer_region(c.buffer);
       }
       dev->destroy_resource(c.buffer);
     }
+    if (f.json.empty()) continue;  // the SSAO pass's output, written with its frame
     if (FILE* const out = DevOpen(g_dev_dir / L"frames" / L"frames.jsonl", L"ab")) {
       std::fputs((f.json + "\n").c_str(), out);
       std::fclose(out);
@@ -880,13 +792,20 @@ void OnDestroyPipeline(device*, pipeline p) {
 
 void OnInitCommandList(command_list* cmd_list) { cmd_list->create_private_data<CmdData>(); }
 
-void OnDestroyCommandList(command_list* cmd_list) { cmd_list->destroy_private_data<CmdData>(); }
+void ForgetAoCopy(command_list* cmd_list);  // below
+
+void OnDestroyCommandList(command_list* cmd_list) {
+  ForgetAoCopy(cmd_list);
+  cmd_list->destroy_private_data<CmdData>();
+}
 
 void OnResetCommandList(command_list* cmd_list) {
+  ForgetAoCopy(cmd_list);
   if (auto* data = cmd_list->get_private_data<CmdData>()) *data = CmdData();
 }
 
 void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
+  DevAoCopy(cmd_list);
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return;
   data->current = p;
@@ -933,11 +852,18 @@ const Tables* ComputeTables(const state_tracking& state) {
   return nullptr;
 }
 
+// The graphics root signature and the descriptor tables bound with it.
+const Tables* GraphicsTables(const state_tracking& state) {
+  for (const auto& [stages, tables] : state.descriptor_tables)
+    if ((stages & shader_stage::pixel) != 0) return &tables;
+  return nullptr;
+}
+
 resource BoundResource(device* dev, const p3rdlss::Descriptors& descriptors, const Tables& tables, RegisterKind kind,
-                       uint32_t reg) {
+                       uint32_t reg, shader_stage stage = shader_stage::compute) {
   descriptor_heap heap = {0};
   uint32_t offset = 0;
-  if (!descriptors.Find(dev, tables.first, tables.second, shader_stage::compute, kind, reg, 0, &heap, &offset))
+  if (!descriptors.Find(dev, tables.first, tables.second, stage, kind, reg, 0, &heap, &offset))
     return {0};
   const resource_view view = descriptors.View(heap, offset);
   return view == 0 ? resource{0} : dev->get_resource_from_view(view);
@@ -1005,6 +931,445 @@ bool ReadTaaConstants(device* dev, const p3rdlss::Descriptors& descriptors, cons
   out->pre_exposure = *at(kPreExposure);
   std::memcpy(out->taa_params, at(kTemporalAAParams), sizeof(out->taa_params));
   return true;
+}
+
+// --- SSAO's noise ----------------------------------------------------------------------------------------------
+
+// The game's SSAO pass (one full-screen triangle into an R8 target at the render size) rotates its samples by vectors
+// from a 64x64 R8G8 noise texture (its pixel shader's t3, point sampled, one texel a pixel: ScreenSpaceAOParams[1].xy
+// is the render size / 64). It is Unreal's SSAORandomization: 16 rotations over half a turn, the same in every 4x4
+// tile. Each frame the lookup shifts by TemporalOffset = (TAA sample index % 8) * (2.48, 7.52) / 64
+// (ScreenSpaceAOParams[3].xy: row 30 of the pixel shader's $Globals, b0, with 1 / tan(fov / 2) in .w). The sample
+// index also picks the camera jitter, so every jitter position meets the same rotations: the game's TAA blurs the 8
+// steps together, DLSS keeps them as a fine lattice on skin and in corners (Junpei's cheek; docs/recon.md).
+// While DLSS runs (SsaoBlueNoise), the texture holds spatiotemporal blue noise instead, the next of its 64 frames at
+// every present, and the offset is 0: every frame's rotations are blue noise with no tile, and every pixel walks
+// through well-spread rotations over the frames. The noise (src/stbn_64x64x64.bin, made by tools/make_stbn.py) gives
+// the angle over half a turn; the vector's length, which scales the sample radius, is 1 - 0.23 v with v the noise
+// half the volume away (Unreal's lengths also run from 0.77 to 1). The game's noise is read back first and goes back
+// into the texture when DLSS or the setting is off.
+constexpr float kAoStepX = 2.48f / 64.0f, kAoStepY = 7.52f / 64.0f;  // TemporalOffset's step
+constexpr uint32_t kAoOffsetRow = 30;     // ScreenSpaceAOParams[3] in the pixel shader's $Globals (b0)
+constexpr uint32_t kAoNoiseSrv = 3;       // the pixel shader's noise texture (t3)
+constexpr uint32_t kNoiseSize = 64;       // texels a side
+constexpr uint32_t kNoiseFrames = 64;     // blue noise frames
+constexpr uint32_t kNoiseRowPitch = 256;  // bytes a texel row in the add-on's buffer (64 texels of 2 bytes, padded)
+constexpr uint64_t kNoiseSliceBytes = uint64_t{kNoiseRowPitch} * kNoiseSize;
+constexpr uint32_t kNoiseGameSlice = kNoiseFrames;  // the game's noise, read back, after the blue noise frames
+constexpr int kStbnResource = 101;        // src/stbn_64x64x64.bin (version.rc.in)
+constexpr float kPi = 3.14159265358979f;
+
+std::atomic<uint64_t> g_ao_seen_frame{0};  // g_frame at the last SSAO pass seen while DLSS ran
+std::atomic<int> g_ao_step{-1};            // the step the game gave that pass's offset, -1 if not found
+std::atomic<bool> g_ao_zeroed{false};      // its offset was set to 0
+std::atomic<bool> g_ao_logged_found{false}, g_ao_logged_missing{false};
+std::atomic<int> g_dev_ao_waiting{0};      // development: command lists with a copy of the pass's output to make
+
+// Every 64x64 R8G8 texture the game creates, with the state its last barrier left it in (a resource_usage). Unreal
+// uploads the noise texture's contents once and never moves it again, so that is the state it rests in.
+struct TrackedTexture {
+  std::atomic<uint64_t> handle{0};
+  std::atomic<uint32_t> state{0};
+};
+constexpr uint32_t kTrackedTextures = 16;
+std::array<TrackedTexture, kTrackedTextures> g_rg8;
+std::atomic<uint32_t> g_rg8_count{0};  // slots in use or used before
+std::mutex g_rg8_mutex;                // their creation and destruction
+
+// The noise texture and the add-on's buffer, at the present (g_noise_mutex; the atomics are read without it).
+std::atomic<uint64_t> g_noise_bound{0};    // the noise texture the SSAO pass bound last (set at the pass)
+std::atomic<uint64_t> g_noise_texture{0};  // g_noise
+std::atomic<bool> g_noise_active{false};   // the texture holds blue noise: the pass's offset is 0
+std::atomic<uint64_t> g_noise_written{0};  // blue noise frames written
+std::mutex g_noise_mutex;
+resource g_noise = {0};
+resource_usage g_noise_state = resource_usage::undefined;
+bool g_noise_known = false;    // g_noise_state was followed from the texture's creation (0 is D3D12's common state)
+resource g_noise_upload = {0};  // kNoiseFrames frames of blue noise, then the game's noise, as the copies read them
+bool g_noise_saved = false;     // the game's noise is in g_noise_upload
+bool g_noise_failed = false;    // the buffer could not be made or filled: blue noise stays off
+std::string g_noise_status = "Blue-noise SSAO: the SSAO pass's noise texture has not been seen yet.";
+
+// The step k of a row (x, y, z, w) = (k * 2.48 / 64, k * 7.52 / 64, ..., 1 / tan(fov / 2)), or -1.
+int AoOffsetStep(const float* row) {
+  if (!(row[3] > 0.2f && row[3] < 10.0f)) return -1;
+  const float kx = row[0] / kAoStepX, ky = row[1] / kAoStepY;
+  const long k = std::lround(kx);
+  if (k < 0 || k > 7 || std::fabs(kx - static_cast<float>(k)) > 1e-3f ||
+      std::fabs(ky - static_cast<float>(k)) > 1e-3f)
+    return -1;
+  return static_cast<int>(k);
+}
+
+// Sets the SSAO pass's offset to 0: row 30 of its pixel shader's b0, a root constant buffer the game filled in an
+// upload heap, before the GPU reads it; only when the row holds an offset.
+void ZeroSsaoOffset(command_list* cmd, const CmdData& data) {
+  device* const dev = cmd->get_device();
+  auto* const descriptors = dev->get_private_data<p3rdlss::Descriptors>();
+  if (descriptors == nullptr) return;
+  const std::vector<p3rdlss::Descriptors::ParamInfo> params = descriptors->Params(data.gfx_cbv_layout);
+  uint32_t param = UINT32_MAX;
+  for (uint32_t i = 0; i < params.size(); ++i) {
+    const p3rdlss::Descriptors::ParamInfo& p = params[i];
+    if (p.ranges.size() == 1 && p.ranges[0].type == descriptor_type::constant_buffer &&
+        p.ranges[0].dx_register_index == 0 && p.ranges[0].dx_register_space == 0 &&
+        p.ranges[0].visibility == shader_stage::pixel) {
+      param = i;
+      break;
+    }
+  }
+  float row[4] = {};
+  int step = -1;
+  if (param < data.gfx_cbvs.size() && data.gfx_cbvs[param].buffer != 0 &&
+      ReadBuffer(dev, data.gfx_cbvs[param], kAoOffsetRow * 16, sizeof(row), row))
+    step = AoOffsetStep(row);
+  bool zeroed = false;
+  if (step >= 0) {
+    const buffer_range& range = data.gfx_cbvs[param];
+    void* mapped = nullptr;
+    if (dev->map_buffer_region(range.buffer, range.offset + kAoOffsetRow * 16, 2 * sizeof(float),
+                               map_access::write_only, &mapped) &&
+        mapped != nullptr) {
+      std::memset(mapped, 0, 2 * sizeof(float));
+      dev->unmap_buffer_region(range.buffer);
+      zeroed = true;
+    }
+  }
+  g_ao_step = step;
+  g_ao_zeroed = zeroed;
+  char text[220];
+  if (zeroed && !g_ao_logged_found.exchange(true)) {
+    std::snprintf(text, sizeof(text),
+                  "SSAO: its noise offset is row 30 of the pixel shader's b0 (root parameter %u), 0 while the "
+                  "blue noise runs.",
+                  param);
+    Log(reshade::log::level::info, text);
+  } else if (!zeroed && !g_ao_logged_missing.exchange(true)) {
+    std::snprintf(text, sizeof(text),
+                  "SSAO: row 30 of the pixel shader's b0 (root parameter %d) holds no noise offset (%g %g %g %g); "
+                  "the blue noise keeps the game's offset there.",
+                  param == UINT32_MAX ? -1 : static_cast<int>(param), row[0], row[1], row[2], row[3]);
+    Log(reshade::log::level::warning, text);
+  }
+}
+
+// Unreal's FMath::Quantize8SignedByte: -1..1 to 0..255.
+uint8_t Quantize8Signed(float v) {
+  return static_cast<uint8_t>(std::clamp(static_cast<int>((v * 0.5f + 0.5f) * 255.999f), 0, 255));
+}
+
+// A texel of Unreal's SSAORandomization (FSystemTextures): 16 rotations over half a turn with lengths 0.77 to 1, in
+// a 4x4 tile.
+void UnrealNoiseTexel(uint32_t x, uint32_t y, uint8_t rg[2]) {
+  static constexpr int kReorder[16] = {0, 11, 7, 3, 10, 4, 15, 12, 6, 8, 1, 14, 13, 2, 9, 5};
+  const float w = static_cast<float>(kReorder[(x % 4) + (y % 4) * 4]);
+  const float angle = w / 16.0f * kPi;
+  const float length = 1.0f - (std::sin(198.0f * w * 0.01f) * 0.5f + 0.5f) * 23.0f * 0.01f;
+  rg[0] = Quantize8Signed(std::cos(angle) * length);
+  rg[1] = Quantize8Signed(std::sin(angle) * length);
+}
+
+bool IsNoiseTexture(const resource_desc& desc) {
+  return desc.type == resource_type::texture_2d && desc.texture.width == kNoiseSize &&
+         desc.texture.height == kNoiseSize && desc.texture.depth_or_layers == 1 && desc.texture.levels == 1 &&
+         (desc.texture.format == format::r8g8_unorm || desc.texture.format == format::r8g8_typeless);
+}
+
+void OnInitResource(device*, const resource_desc& desc, const subresource_data*, resource_usage state, resource res) {
+  if (!IsNoiseTexture(desc)) return;
+  std::lock_guard lock(g_rg8_mutex);
+  const uint32_t count = g_rg8_count.load();
+  uint32_t slot = count;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (g_rg8[i].handle.load() == 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot >= kTrackedTextures) return;
+  g_rg8[slot].state = static_cast<uint32_t>(state);
+  g_rg8[slot].handle = res.handle;
+  if (slot == count) g_rg8_count = count + 1;
+}
+
+bool TrackedState(resource res, resource_usage* state) {
+  const uint32_t count = g_rg8_count.load();
+  for (uint32_t i = 0; i < count; ++i) {
+    if (g_rg8[i].handle.load() == res.handle) {
+      *state = static_cast<resource_usage>(g_rg8[i].state.load());
+      return true;
+    }
+  }
+  return false;
+}
+
+void OnBarrier(command_list* cmd_list, uint32_t count, const resource* resources, const resource_usage*,
+               const resource_usage* new_states) {
+  DevAoCopy(cmd_list);
+  const uint32_t tracked = g_rg8_count.load(std::memory_order_acquire);
+  if (tracked == 0) return;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (resources[i] == 0) continue;
+    for (uint32_t j = 0; j < tracked; ++j)
+      if (g_rg8[j].handle.load(std::memory_order_relaxed) == resources[i].handle)
+        g_rg8[j].state = static_cast<uint32_t>(new_states[i]);
+  }
+}
+
+// From OnDestroyResource.
+void ForgetNoiseTexture(resource res) {
+  const uint32_t count = g_rg8_count.load();
+  for (uint32_t i = 0; i < count; ++i) {
+    if (g_rg8[i].handle.load() != res.handle) continue;
+    std::lock_guard lock(g_rg8_mutex);
+    if (g_rg8[i].handle.load() == res.handle) g_rg8[i].handle = 0;
+  }
+  uint64_t bound = res.handle;
+  g_noise_bound.compare_exchange_strong(bound, 0);
+  if (g_noise_texture.load() != res.handle) return;
+  std::lock_guard lock(g_noise_mutex);
+  if (g_noise != res) return;
+  g_noise = {0};
+  g_noise_known = false;
+  g_noise_texture = 0;
+  g_noise_saved = false;
+  g_noise_active = false;
+  g_noise_status = "Blue-noise SSAO: the game released its noise texture.";
+}
+
+// The add-on's buffer: kNoiseFrames frames of blue noise as Unreal encodes its rotation vectors, then room for the
+// game's noise. Rows of kNoiseRowPitch bytes, as copies between buffers and textures want them.
+bool CreateNoiseUpload(device* dev) {
+  const HRSRC info = FindResourceW(g_module, MAKEINTRESOURCEW(kStbnResource), RT_RCDATA);
+  const HGLOBAL handle = info != nullptr ? LoadResource(g_module, info) : nullptr;
+  const auto* const stbn = handle != nullptr ? static_cast<const uint8_t*>(LockResource(handle)) : nullptr;
+  if (stbn == nullptr || SizeofResource(g_module, info) != kNoiseSize * kNoiseSize * kNoiseFrames) {
+    g_noise_status = "Blue-noise SSAO: the add-on's noise data is missing.";
+    return false;
+  }
+  const uint64_t size = kNoiseSliceBytes * (kNoiseFrames + 1);
+  if (!dev->create_resource(resource_desc(size, memory_heap::upload, resource_usage::copy_source), nullptr,
+                            resource_usage::cpu_access, &g_noise_upload)) {
+    g_noise_status = "Blue-noise SSAO: the add-on's buffer could not be created.";
+    return false;
+  }
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(g_noise_upload, 0, size, map_access::write_only, &mapped) || mapped == nullptr) {
+    dev->destroy_resource(g_noise_upload);
+    g_noise_upload = {0};
+    g_noise_status = "Blue-noise SSAO: the add-on's buffer could not be written.";
+    return false;
+  }
+  auto* const out = static_cast<uint8_t*>(mapped);
+  std::memset(out, 0, size);
+  const auto value = [stbn](uint32_t t, uint32_t y, uint32_t x) {
+    const uint8_t v = stbn[(t % kNoiseFrames * kNoiseSize + y % kNoiseSize) * kNoiseSize + x % kNoiseSize];
+    return (static_cast<float>(v) + 0.5f) / 256.0f;
+  };
+  for (uint32_t t = 0; t < kNoiseFrames; ++t) {
+    for (uint32_t y = 0; y < kNoiseSize; ++y) {
+      for (uint32_t x = 0; x < kNoiseSize; ++x) {
+        const float angle = kPi * value(t, y, x);
+        const float length = 1.0f - 0.23f * value(t + kNoiseFrames / 2, y + kNoiseSize / 2, x + kNoiseSize / 2);
+        uint8_t* const texel = out + t * kNoiseSliceBytes + y * kNoiseRowPitch + x * 2;
+        texel[0] = Quantize8Signed(length * std::cos(angle));
+        texel[1] = Quantize8Signed(length * std::sin(angle));
+      }
+    }
+  }
+  dev->unmap_buffer_region(g_noise_upload);
+  return true;
+}
+
+// Reads the game's noise into the add-on's buffer, once, waiting for the GPU; logs whether it is Unreal's tile.
+bool SaveGameNoise(command_queue* queue) {
+  device* const dev = queue->get_device();
+  resource readback = {0};
+  if (!dev->create_resource(resource_desc(kNoiseSliceBytes, memory_heap::readback, resource_usage::copy_dest), nullptr,
+                            resource_usage::copy_dest, &readback)) {
+    g_noise_status = "Blue-noise SSAO: the game's noise could not be read back.";
+    return false;
+  }
+  command_list* const cmd = queue->get_immediate_command_list();
+  cmd->barrier(g_noise, g_noise_state, resource_usage::copy_source);
+  cmd->copy_texture_to_buffer(g_noise, 0, nullptr, readback, 0, kNoiseRowPitch / 2, kNoiseSize);
+  cmd->barrier(g_noise, resource_usage::copy_source, g_noise_state);
+  queue->flush_immediate_command_list();
+  queue->wait_idle();
+  bool saved = false;
+  int differ = -1;
+  void* data = nullptr;
+  if (dev->map_buffer_region(readback, 0, kNoiseSliceBytes, map_access::read_only, &data) && data != nullptr) {
+    void* slot = nullptr;
+    if (dev->map_buffer_region(g_noise_upload, kNoiseGameSlice * kNoiseSliceBytes, kNoiseSliceBytes,
+                               map_access::write_only, &slot) &&
+        slot != nullptr) {
+      std::memcpy(slot, data, kNoiseSliceBytes);
+      dev->unmap_buffer_region(g_noise_upload);
+      saved = true;
+    }
+    differ = 0;
+    for (uint32_t y = 0; y < kNoiseSize; ++y) {
+      for (uint32_t x = 0; x < kNoiseSize; ++x) {
+        uint8_t rg[2];
+        UnrealNoiseTexel(x, y, rg);
+        const uint8_t* const texel = static_cast<const uint8_t*>(data) + y * kNoiseRowPitch + x * 2;
+        if (std::abs(texel[0] - rg[0]) > 1 || std::abs(texel[1] - rg[1]) > 1) ++differ;
+      }
+    }
+    dev->unmap_buffer_region(readback);
+  }
+  dev->destroy_resource(readback);
+  if (!saved) {
+    g_noise_status = "Blue-noise SSAO: the game's noise could not be saved.";
+    return false;
+  }
+  Log(reshade::log::level::info,
+      differ == 0 ? std::string("SSAO: read the game's noise back: Unreal's 4x4 tile of rotations.")
+                  : "SSAO: read the game's noise back; " + std::to_string(differ) +
+                        " of 4096 texels differ from Unreal's tile (it goes back as read).");
+  return true;
+}
+
+void WriteNoise(command_queue* queue, uint32_t slice) {
+  command_list* const cmd = queue->get_immediate_command_list();
+  cmd->barrier(g_noise, g_noise_state, resource_usage::copy_dest);
+  cmd->copy_buffer_to_texture(g_noise_upload, slice * kNoiseSliceBytes, kNoiseRowPitch / 2, kNoiseSize, g_noise, 0);
+  cmd->barrier(g_noise, resource_usage::copy_dest, g_noise_state);
+  queue->flush_immediate_command_list();
+}
+
+// At every present: takes over the noise texture the SSAO pass bound, then writes the next blue noise frame into it
+// while DLSS and the pass run with SsaoBlueNoise, or the game's noise once that ends. The copies run on the present's
+// queue between frames, where the texture rests in its usual state.
+void SsaoNoisePresent(command_queue* queue, uint64_t frame) {
+  const bool blue = g_config.ssao_blue_noise && g_config.enabled && g_last_dlss_frame.load() + 2 >= frame &&
+                    g_ao_seen_frame.load() + 2 >= frame;
+  std::lock_guard lock(g_noise_mutex);
+  const resource bound = {g_noise_bound.load()};
+  if (bound != 0 && bound != g_noise) {
+    if (g_noise_active && g_noise != 0) WriteNoise(queue, kNoiseGameSlice);  // a texture the game still has
+    g_noise = bound;
+    g_noise_texture = bound.handle;
+    g_noise_saved = false;
+    g_noise_active = false;
+    g_noise_known = TrackedState(bound, &g_noise_state);
+    char text[200];
+    if (!g_noise_known)
+      std::snprintf(text, sizeof(text),
+                    "SSAO: its noise texture (t3, 64x64 R8G8) is %llx, made before the add-on could follow its "
+                    "state; blue noise stays off.",
+                    static_cast<unsigned long long>(bound.handle));
+    else
+      std::snprintf(text, sizeof(text), "SSAO: its noise texture (t3, 64x64 R8G8) is %llx, resting in state 0x%x.",
+                    static_cast<unsigned long long>(bound.handle), static_cast<unsigned>(g_noise_state));
+    Log(reshade::log::level::info, text);
+    g_noise_status = !g_noise_known
+                         ? "Blue-noise SSAO: the noise texture's state is unknown (it was made before the add-on loaded)."
+                         : "Blue-noise SSAO: waiting for DLSS and the SSAO pass.";
+  }
+  if (g_noise == 0 || !g_noise_known || g_noise_failed) return;
+  resource_usage state = g_noise_state;
+  if (TrackedState(g_noise, &state) && state != g_noise_state) {
+    if (state == resource_usage::copy_dest) return;  // the game is writing it
+    char text[120];
+    std::snprintf(text, sizeof(text), "SSAO: its noise texture moved from state 0x%x to 0x%x.",
+                  static_cast<unsigned>(g_noise_state), static_cast<unsigned>(state));
+    Log(reshade::log::level::warning, text);
+    g_noise_state = state;
+  }
+  if (blue) {
+    if (g_noise_upload == 0 && !CreateNoiseUpload(queue->get_device())) {
+      g_noise_failed = true;
+      Log(reshade::log::level::warning, g_noise_status);
+      return;
+    }
+    if (!g_noise_saved) {
+      if (!SaveGameNoise(queue)) {
+        g_noise_failed = true;
+        Log(reshade::log::level::warning, g_noise_status);
+        return;
+      }
+      g_noise_saved = true;
+    }
+    WriteNoise(queue, static_cast<uint32_t>(g_noise_written++ % kNoiseFrames));
+    if (!g_noise_active.exchange(true))
+      Log(reshade::log::level::info, "SSAO: blue noise from frame " + std::to_string(frame) + " on.");
+  } else if (g_noise_active) {
+    WriteNoise(queue, kNoiseGameSlice);
+    g_noise_active = false;
+    g_noise_status = "Blue-noise SSAO: the game's noise is back (DLSS, the SSAO pass or the setting is off).";
+    Log(reshade::log::level::info, "SSAO: the game's noise is back (frame " + std::to_string(frame) + ").");
+  }
+}
+
+// The SSAO pass: a full-screen triangle (3 indices, one instance) into one R8 target at DLSS's render size, while
+// DLSS runs.
+void SsaoDraw(command_list* cmd, uint32_t vertices, uint32_t instances) {
+  if (vertices != 3 || instances != 1 || !g_config.enabled || g_last_dlss_frame.load() + 2 < g_frame.load()) return;
+  auto* const state = cmd->get_private_data<state_tracking>();
+  auto* const data = cmd->get_private_data<CmdData>();
+  if (state == nullptr || data == nullptr || state->render_targets.size() != 1 || state->render_targets[0] == 0) return;
+  device* const dev = cmd->get_device();
+  const format f = dev->get_resource_view_desc(state->render_targets[0]).format;
+  if (f != format::r8_unorm && f != format::r8_typeless) return;
+  const resource target = dev->get_resource_from_view(state->render_targets[0]);
+  const resource_desc desc = dev->get_resource_desc(target);
+  if (desc.texture.width != g_render_width.load() || desc.texture.height != g_render_height.load()) return;
+  g_ao_seen_frame = g_frame.load();
+  if (g_config.ssao_blue_noise) {
+    const Tables* const tables = GraphicsTables(*state);
+    auto* const descriptors = dev->get_private_data<p3rdlss::Descriptors>();
+    if (tables != nullptr && descriptors != nullptr) {
+      const resource noise =
+          BoundResource(dev, *descriptors, *tables, RegisterKind::kShaderResource, kAoNoiseSrv, shader_stage::pixel);
+      if (noise != 0 && IsNoiseTexture(dev->get_resource_desc(noise))) g_noise_bound = noise.handle;
+    }
+    if (g_noise_active) ZeroSsaoOffset(cmd, *data);
+  }
+  // Development: the pass's output of a frame being dumped, copied once the pass is recorded.
+  if (g_config.dev_dumps && g_dev_frames_left.load() > 0 && data->ao_dump == 0) {
+    data->ao_dump = target;
+    data->ao_dump_frame = g_frame.load();
+    ++g_dev_ao_waiting;
+  }
+}
+
+// Development: copies the SSAO pass's output (still a render target) at the next command recorded after the pass,
+// to be written with its frame's dump as <frame>_ao_<w>x<h>.bin, one byte a pixel.
+void DevAoCopy(command_list* cmd) {
+  if (g_dev_ao_waiting.load(std::memory_order_relaxed) == 0) return;
+  auto* const data = cmd->get_private_data<CmdData>();
+  if (data == nullptr || data->ao_dump == 0) return;
+  const resource target = data->ao_dump;
+  data->ao_dump = {0};
+  --g_dev_ao_waiting;
+  device* const dev = cmd->get_device();
+  const resource_desc desc = dev->get_resource_desc(target);
+  const uint32_t w = desc.texture.width, h = desc.texture.height;
+  const uint32_t row = (w + 255) / 256 * 256;  // one byte a pixel, rows of a multiple of 256 bytes
+  const uint64_t size = uint64_t{row} * h;
+  resource buffer = {0};
+  if (!dev->create_resource(resource_desc(size, memory_heap::readback, resource_usage::copy_dest), nullptr,
+                            resource_usage::copy_dest, &buffer))
+    return;
+  cmd->barrier(target, resource_usage::render_target, resource_usage::copy_source);
+  const subresource_box box = {0, 0, 0, w, h, 1};
+  cmd->copy_texture_to_buffer(target, 0, &box, buffer, 0, row, h);
+  cmd->barrier(target, resource_usage::copy_source, resource_usage::render_target);
+  DevFrame frame;
+  frame.frame = data->ao_dump_frame;
+  frame.copies.push_back({buffer, w, h, row, size, "ao", 1});
+  std::lock_guard lock(g_dev_mutex);
+  g_dev_pending.push_back(std::move(frame));
+}
+
+void ForgetAoCopy(command_list* cmd_list) {
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data != nullptr && data->ao_dump != 0) {
+    data->ao_dump = {0};
+    --g_dev_ao_waiting;
+  }
 }
 
 // The format that reads a depth texture's depth plane, or unknown.
@@ -1133,6 +1498,7 @@ resource_view GameView(device* dev, resource res, format fmt) {
 }
 
 void OnDestroyResource(device* dev, resource res) {
+  ForgetNoiseTexture(res);
   std::lock_guard lock(g_view_mutex);
   const auto it = g_views.find(res.handle);
   if (it == g_views.end()) return;
@@ -1349,15 +1715,19 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   }
   if (g_config.dev_dumps && g_dev_frames_left.load() > 0) {
     const int32_t* const samples = g_taa_samples.load();
-    char json[448];
+    char json[640];
     std::snprintf(json, sizeof(json),
                   "{\"frame\": %llu, \"dispatch\": %llu, \"render\": [%u, %u], \"input\": [%u, %u], \"output\": [%u, %u], "
                   "\"jitter\": [%.6f, %.6f], \"pre_exposure\": %.6g, \"phases\": %d, \"reset\": %d, \"mode\": %d, "
-                  "\"preset\": %d, \"taa_params\": [%.0f, %.0f, %.4f, %.4f], \"ssao_off\": %d}",
+                  "\"preset\": %d, \"taa_params\": [%.0f, %.0f, %.4f, %.4f], \"ssao_off\": %d, \"ssao_blue_noise\": %d, "
+                  "\"ssao_blue\": %d, \"ssao_step\": %d, \"ssao_zeroed\": %d, \"stbn_frame\": %llu}",
                   static_cast<unsigned long long>(frame), static_cast<unsigned long long>(dispatch), render_width,
                   render_height, in_width, in_height, width, height, jitter_x, jitter_y, c.pre_exposure,
                   samples != nullptr ? samples[1] : -1, in.reset ? 1 : 0, g_config.mode, g_config.preset,
-                  c.taa_params[0], c.taa_params[1], c.taa_params[2], c.taa_params[3], g_dev_no_ssao.load() ? 1 : 0);
+                  c.taa_params[0], c.taa_params[1], c.taa_params[2], c.taa_params[3], g_dev_no_ssao.load() ? 1 : 0,
+                  g_config.ssao_blue_noise ? 1 : 0, g_noise_active.load() ? 1 : 0, g_ao_step.load(),
+                  g_ao_zeroed.load() ? 1 : 0,
+                  static_cast<unsigned long long>(g_noise_written.load()));
     DevDumpFrame(cmd_list, color, render_width, render_height, output, width, height, json);
   }
   g_last_dlss_frame = frame;
@@ -1486,6 +1856,7 @@ void LogTaaPass(command_list* cmd_list, const CmdData& data, uint32_t gx, uint32
 }
 
 bool OnDispatch(command_list* cmd_list, uint32_t gx, uint32_t gy, uint32_t gz) {
+  DevAoCopy(cmd_list);
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   if (g_config.dev_dumps) DevTrace(cmd_list, true, gx, gy, gz);
@@ -1665,6 +2036,16 @@ void OnDestroyDevice(device* dev) {
     if (r.res != 0) dev->destroy_resource(r.res);
   }
   g_retired.clear();
+  {
+    std::lock_guard noise_lock(g_noise_mutex);
+    if (g_noise_upload != 0) dev->destroy_resource(g_noise_upload);
+    g_noise_upload = {0};
+    g_noise = {0};
+    g_noise_known = false;
+    g_noise_texture = 0;
+    g_noise_saved = false;
+    g_noise_active = false;
+  }
   if (g_mv_pipeline != 0) dev->destroy_pipeline(g_mv_pipeline);
   if (g_mv_layout != 0) dev->destroy_pipeline_layout(g_mv_layout);
   g_mv_pipeline = {0};
@@ -1782,6 +2163,7 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
     g_dlss.ReleaseFeature();
     g_recreate = false;
   }
+  SsaoNoisePresent(queue, frame);
   if (g_config.dev_dumps) DevDumpPresent(queue, frame);
   if (g_device != nullptr) {
     std::lock_guard lock(g_dlss_mutex);
@@ -1859,10 +2241,14 @@ void OnOverlay(effect_runtime*) {
                         "textures shimmer or show moire in motion, move it toward 0. The game's own TAA path uses 0.");
   if (ImGui::Checkbox("Game exposure", &g_config.game_exposure)) SaveConfig();
   ImGui::SetItemTooltip("Give DLSS the game's eye adaptation exposure. Off lets DLSS estimate one.");
-  if (ImGui::Checkbox("Smooth SSAO noise", &g_config.ssao_noise_fix)) SaveConfig();
-  ImGui::SetItemTooltip("The game's ambient occlusion steps its 4x4 noise pattern in time with the camera jitter, so "
-                        "DLSS keeps it as a fine grid (on skin, in corners). On: while DLSS runs, the noise takes a "
-                        "random one of its 8 steps each frame and DLSS averages it out, as the game's TAA does.");
+  bool blue_noise = g_config.ssao_blue_noise;
+  if (ImGui::Checkbox("Blue-noise SSAO", &blue_noise)) {
+    g_config.ssao_blue_noise = blue_noise;
+    SaveConfig();
+  }
+  ImGui::SetItemTooltip("The game's ambient occlusion rotates its samples by a 4x4 tile of noise that steps with the "
+                        "camera jitter, so DLSS keeps it as a fine lattice on skin and in corners. On: while DLSS "
+                        "runs, that noise is spatiotemporal blue noise, new every frame and without a tile.");
 
   ImGui::Separator();
   if (ImGui::Checkbox("NVIDIA Reflex low latency", &g_config.reflex)) SaveConfig();
@@ -1934,12 +2320,14 @@ void OnOverlay(effect_runtime*) {
   else if (g_config.enabled)
     ImGui::TextUnformatted("Not running this frame (the game's TAA runs).");
   if (g_failures.load() != 0) ImGui::Text("Failed evaluations: %llu", static_cast<unsigned long long>(g_failures.load()));
-  if (g_config.ssao_noise_fix) {
-    if (g_ao_last_frame.load() + 2 >= g_frame.load())
-      ImGui::Text("SSAO noise: step %d (the game's: %d), %u constant buffer row(s)", g_ao_to.load(), g_ao_from.load(),
-                  g_ao_rows.load());
-    else
-      ImGui::TextUnformatted("SSAO noise: the SSAO pass was not seen this frame");
+  if (g_config.ssao_blue_noise) {
+    if (g_noise_active && g_ao_seen_frame.load() + 2 >= g_frame.load()) {
+      ImGui::Text("Blue-noise SSAO: frame %llu of %u%s", static_cast<unsigned long long>(g_noise_written.load() % kNoiseFrames),
+                  kNoiseFrames, g_ao_zeroed ? "" : " (with the game's offset: not found)");
+    } else {
+      std::lock_guard lock(g_noise_mutex);
+      ImGui::TextWrapped("%s", g_noise_status.c_str());
+    }
   }
   if (g_config.dev_dumps) {
     ImGui::Separator();
@@ -1961,6 +2349,7 @@ void OnOverlay(effect_runtime*) {
 
 void Initialize(HMODULE module) {
   wchar_t path[MAX_PATH] = {};
+  g_module = module;
   GetModuleFileNameW(module, path, MAX_PATH);
   g_addon_dir = fs::path(path).parent_path();
   g_data_dir = g_addon_dir / L"Persona3ReloadDLSS";
@@ -2014,6 +2403,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::draw>(OnDevDraw);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDevDrawIndexed);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+          [](command_list* cmd_list, uint32_t, const resource_view*, resource_view) { DevAoCopy(cmd_list); });
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       // Reflex: the present markers after every other present callback, right before the swap chain presents; the
       // sleep right after it; the frame's first submission.

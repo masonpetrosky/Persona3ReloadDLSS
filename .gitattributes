@@ -1,2 +1,5 @@
 # Shell scripts run in Git Bash, which does not accept CRLF line endings.
 *.sh text eol=lf
+
+# Binary data (src/stbn_64x64x64.bin): never converted.
+*.bin binary

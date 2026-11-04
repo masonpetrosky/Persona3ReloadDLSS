@@ -26,6 +26,10 @@ engine multiplies the jitter phases by 1 / scale², and the game keeps its place
 Ultra Performance gets 14 (125 phases, under the 128 where it breaks). The planar reflection view's own TAA pass is
 left alone.
 
+Unreal's SSAO rotates its samples by a 4x4 tile of noise that steps with the camera jitter, so DLSS would keep it as
+a fine lattice on skin and in corners. While DLSS runs, the add-on fills that noise texture with spatiotemporal blue
+noise instead (64 frames made by `tools/make_stbn.py`, a new one every frame) and zeroes the step.
+
 ## Requirements
 
 An NVIDIA RTX GPU and ReShade 6.8 or newer with full add-on support, as `dxgi.dll` in `P3R\Binaries\Win64`. Works
@@ -65,6 +69,7 @@ what the add-on is doing. The add-on logs to `ReShade.log`, prefixed `[P3RDLSS]`
 | `Reflex` | 1 | NVIDIA Reflex low-latency mode, injected at the present (the game has none), with or without DLSS |
 | `FrameRateCap` | 0 | 0 keeps the game's frame rate limit; otherwise the game presents on every refresh (`rhi.SyncInterval` 1 instead of the game's 2 at 120 fps) and Reflex's sleep holds this cap (`t.MaxFPS` without Reflex); with a variable refresh rate display a few frames under its refresh rate, such as 237 at 240 Hz |
 | `GameExposure` | 1 | DLSS gets the game's eye adaptation exposure; 0 lets DLSS estimate one |
+| `SsaoBlueNoise` | 1 | while DLSS runs, SSAO's noise is spatiotemporal blue noise, new every frame, instead of the game's 4x4 tile that steps with the jitter (a fine lattice on skin under DLSS); 0 keeps the game's noise |
 | `MotionVectors` | 0 | development: 1 camera motion only, 2 none |
 
 ## HUD fix (a second add-on)

@@ -33,6 +33,8 @@ Using it
   - Frame rate cap: the game's own options stop at 120 FPS. A cap here replaces the game's limit, for example 237 on
     a 240 Hz display with G-SYNC or FreeSync; 0 keeps the game's.
   - Texture mip bias and jitter phases: set as NVIDIA's DLSS guide asks, by default.
+  - Blue-noise SSAO: on by default. The game's ambient occlusion noise would leave a fine lattice on skin and in
+    corners under DLSS; this replaces it with blue noise that changes every frame.
 - ReShade.log in P3R\Binaries\Win64 has the add-on's messages, prefixed [P3RDLSS].
 
 HDR

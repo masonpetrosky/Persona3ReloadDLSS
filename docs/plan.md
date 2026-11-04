@@ -93,6 +93,14 @@ Expected obstacles:
    and the HUD fix as an optional file. Before that the user ran Ultra Performance with the phase cap: the log
    showed 14 jitter phases and 0 corner jitter frames.
 
+5. **After 0.1.0: the lattice on skin.** The user saw a fine dot lattice on Junpei's cheek under DLSS: Unreal's SSAO
+   noise, whose 4x4 tile steps with the camera jitter ([recon.md](recon.md), "The lattice on skin"). A random step
+   unlocked it from the jitter but kept the tile ("better, but not perfect"). Blue-noise SSAO (`SsaoBlueNoise`,
+   default on) fills the game's noise texture with spatiotemporal blue noise every frame and sets the offset to 0.
+   In game 2026-11-03 (test build 8fcaf886): the texture found and read back as Unreal's tile, the lattice gone from the
+   SSAO output, irregular grain in its place on the cheek; the user: "looks good". Then cleaned up (one setting, the
+   offset written only in the pixel shader's row 30); to install and check in the log, then a release.
+
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
 
 ## HUD fix: RenoDX's minimap flash (a second add-on)

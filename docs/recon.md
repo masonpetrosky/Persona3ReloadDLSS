@@ -242,3 +242,36 @@ that closes the pause menu (`tools/rdc_trigger.py` with `RDC_INPUT_DELAYS`); 0.4
   has to match how RenoDX binds its float copy (render target format, pipelines): read in its source first.
 
 Still to capture: a battle.
+
+### The lattice on skin: SSAO's noise (2026-11-03)
+
+Under DLSS a fine dot lattice showed on Junpei's cheek in Paulownia Mall, not under the game's TAA. RenderDoc runs
+out of memory in this game (32 GB, even at an empty shrine), so the add-on dumps what it needs itself (`DevDumps=1`:
+shaders, DLSS's input and output, the SSAO pass's output, a one-frame pass trace; `tools/dev_frames.py`,
+`tools/ssao_noise.py`, `tools/ssao_session.py`).
+
+- Not the cause: the mip bias (0 and -1 alike), 15 jitter phases instead of 16, `r.SSS.Checkerboard`, a random
+  `View.TemporalAAParams.x` or frame counter. With SSAO off (`r.AmbientOcclusionLevels` 0) the lattice is gone
+  (`captures/devdump/2026-11-03-ssao-on`, `-ssao-off`).
+- The pass: one indexed full-screen triangle (PS `8fad8225...`) into an R8_UNORM target at the render size, after a
+  clear and before a tiled pass that writes the same target (8160 instances: 16x16-pixel tiles, by the count). It
+  rotates its samples by vectors from t3, a 64x64 R8G8 texture, point sampled at
+  `ScreenSpaceAOParams[3].xy + ScreenSpaceAOParams[1].xy * uv` ([1].xy = render size / 64: one texel a pixel) and
+  decoded as `rg * 2 - 1`. ScreenSpaceAOParams[0..5] are rows 27 to 32 of the pixel shader's $Globals (b0, 936 bytes,
+  root parameter 5); [3] = (TemporalOffset.xy, StaticFraction, 1 / tan(fov / 2)). The vertex shader's $Globals (root
+  parameter 7) holds DrawRectangle's parameters in rows 0 to 2 and a copy of [0..4] in rows 11 to 15.
+- The texture is Unreal's SSAORandomization (FSystemTextures): read back in game, it is exactly the 4x4 tile of 16
+  rotations over half a turn (lengths 0.77 to 1) that the engine's formula gives, resting as a pixel and non-pixel
+  shader resource. TemporalOffset = (TAA sample index % 8) * (2.48, 7.52) / 64 shifts the tile by one of 8 texel
+  offsets each frame, and the sample index also picks the camera jitter, so every jitter position always meets the same
+  rotations. The game's TAA blurs the 8 steps together; DLSS puts each frame's samples at their jitter positions and
+  keeps the tile as a lattice.
+- A random step each frame (a test build) unlocked the noise from the jitter, but every frame still holds the tile: in
+  DLSS's output a square dot grid on the cheek (`captures/devdump/2026-11-03-stbn`). Averaged in a TAA-like history,
+  random steps even leave more error than the game's own cycle (`tools/make_stbn.py --check`).
+- Spatiotemporal blue noise (Wolfe et al., "Spatiotemporal Blue Noise Masks", EGSR 2022; made by
+  `tools/make_stbn.py`, 64x64 pixels x 64 frames) in the same texture, a new frame each frame, with the offset at 0:
+  the lattice's share of the SSAO output's fine detail falls from 4-13% to 0.04-0.5% in crops of characters, and the
+  cheek in DLSS's output shows irregular grain instead of a lattice. The grain's energy is about what it was: DLSS
+  keeps per-frame noise rather than averaging it out as the game's TAA does. The user: "looks good" (`SsaoBlueNoise`,
+  on by default). The add-on writes each frame at the present, on the swap chain's queue between frames.
