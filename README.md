@@ -1,11 +1,15 @@
 # Persona 3 Reload DLSS
 
-A ReShade add-on that puts NVIDIA DLSS in place of Persona 3 Reload's TAA: DLAA at native resolution first, then
-upscaling. Free and open source (MIT).
+A [ReShade](https://reshade.me) add-on that replaces Persona 3 Reload's temporal anti-aliasing with NVIDIA DLSS on
+Direct3D 12: DLAA at native resolution, or upscaling from a lower render resolution (Quality, Balanced, Performance,
+Ultra Performance) through the engine's own temporal upsampling path. It also adds NVIDIA Reflex and can lift the
+game's 120 FPS limit. A second, separate add-on fixes a HUD glitch that RenoDX's HDR shows over the minimap. Free and
+open source (MIT).
 
-Status: DLAA runs in game since 2026-10-22; upscaling (stage 3, the quality modes) since 2026-11-03, every mode
-tried in game; 0.1.0's release zips are built but not published. See [CHANGELOG.md](CHANGELOG.md),
-[docs/plan.md](docs/plan.md) and [docs/recon.md](docs/recon.md).
+Download: the ready-to-use zips are on the [Releases](https://github.com/masonpetrosky/Persona3ReloadDLSS/releases)
+page; each one's README.txt says how to install it. Developed and tested on one machine (RTX 5070 Ti, 4K, HDR with
+RenoDX, Steam build 22672075, ReShade 6.8). The reverse engineering behind it is in [docs/recon.md](docs/recon.md),
+the plan and its results in [docs/plan.md](docs/plan.md), the versions in [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 
@@ -14,9 +18,12 @@ reads the pass's bindings and constants, turns the game's velocity buffer into D
 from depth where no object wrote velocity, as the TAA does), hands DLSS the scene color, depth, camera jitter and
 the eye adaptation exposure, writes DLSS's image into the pass's output and skips the original dispatch. Bloom, the
 tonemapper and the next frame then read DLSS's image. The game moves its camera jitter between only two positions;
-while DLSS runs, the add-on raises `r.TemporalAASamples` to 16 and switches the engine to its temporal upsampling path
-(`r.TemporalAA.Upsampling` 1, at 100%), whose jitter is the uniform Halton sequence DLSS is trained on (both found in
-memory from the code that registers them). The planar reflection view's own TAA pass is left alone.
+while DLSS runs, the add-on raises `r.TemporalAASamples` to 16, switches the engine to its temporal upsampling path
+(`r.TemporalAA.Upsampling` 1), whose jitter is the uniform Halton sequence DLSS is trained on, and sets the mode's
+render scale (`r.ScreenPercentage`); all three are found in memory from the code that registers them. Below 100% the
+engine multiplies the jitter phases by 1 / scale², and the game keeps its place in the sequence in a signed byte, so
+Ultra Performance gets 14 (125 phases, under the 128 where it breaks). The planar reflection view's own TAA pass is
+left alone.
 
 ## Requirements
 
