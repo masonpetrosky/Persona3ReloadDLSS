@@ -100,7 +100,11 @@ Expected obstacles:
    In game 2026-11-03 (test build 8fcaf886): the texture found and read back as Unreal's tile, the lattice gone from the
    SSAO output, irregular grain in its place on the cheek; the user: "looks good". Then cleaned up (one setting, the
    offset written only in the pixel shader's row 30): 5bc6a81, installed 2026-11-03 22:07 (the user's ini without the
-   development lines). Its log to check at the next start, then a release.
+   development lines). Its first start (22:16) logged as it should: the texture found, Unreal's tile read back, blue
+   noise on, the offset row named once, no warnings, 21,000 DLSS frames. The user also pointed at a smudge under
+   Junpei's sideburn tip and beaded edges on a stroller's thin tubes: both are the same with the game's noise, details
+   under a rendered pixel at Performance's 50%; the user checked Quality and DLAA: "just because of the heavy
+   upscaling. That's fine." Next: a release (0.1.1), after anything else the user wants to look at.
 
 Later, if wanted: DLSS Frame Generation and Reflex, as in EldenRingDLSS 0.4.0.
 
