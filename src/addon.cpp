@@ -674,7 +674,8 @@ void RandomizeSsaoNoise(command_list* cmd, const CmdData& data) {
   }
 }
 
-// The SSAO pass: a full-screen triangle into one R8 target at DLSS's render size, while DLSS runs.
+// The SSAO pass: a full-screen triangle (3 indices, one instance) into one R8 target at DLSS's render size, while
+// DLSS runs.
 void SsaoDraw(command_list* cmd, uint32_t vertices, uint32_t instances) {
   if (!g_config.ssao_noise_fix || !g_config.enabled || vertices != 3 || instances != 1 ||
       g_last_dlss_frame.load() + 2 < g_frame.load())
@@ -754,6 +755,7 @@ bool OnDevDraw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_
   return false;
 }
 bool OnDevDrawIndexed(command_list* cmd, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
+  SsaoDraw(cmd, indices, instances);  // the SSAO pass is an indexed full-screen triangle
   if (g_config.dev_dumps) DevTrace(cmd, false, indices, instances, 1);
   return false;
 }
