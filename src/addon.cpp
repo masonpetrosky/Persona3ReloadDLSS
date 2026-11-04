@@ -88,8 +88,11 @@ constexpr uint32_t kTemporalAAJitter = 2016;    // View: float4, xy = this frame
 constexpr uint32_t kViewRectMin = 2064;         // View: float4
 constexpr uint32_t kViewSizeAndInvSize = 2080;  // View: float4
 constexpr uint32_t kPreExposure = 2164;         // View: float, the exposure the scene color is stored with
+// View: float4 TemporalAAParams, x = the TAA sample index, y = the sample count (the engine's parameter metadata
+// registers it at 0x980, as it registers TemporalAAJitter at 0x7E0 = 2016).
+constexpr uint32_t kTemporalAAParams = 2432;
 constexpr uint32_t kViewBegin = kClipToPrevClip;  // the part of View the add-on reads
-constexpr uint32_t kViewEnd = kPreExposure + 4;
+constexpr uint32_t kViewEnd = kTemporalAAParams + 16;
 
 // What the add-on reads from the TAA's constant buffers.
 struct TaaConstants {
@@ -99,6 +102,7 @@ struct TaaConstants {
   float view_rect_min[2] = {};
   float view_size[4] = {};  // width, height, 1 / width, 1 / height
   float pre_exposure = 1.0f;
+  float taa_params[4] = {};  // TemporalAAParams: sample index (as the passes saw it), sample count
 };
 
 // motion_vectors.hlsl's root constants (b0).
@@ -152,6 +156,8 @@ struct Config {
   bool log_taa_passes = false;
   bool game_exposure = true;  // give DLSS the game's eye adaptation instead of letting it estimate an exposure
   int motion_mode = 0;        // development: 0 the game's velocity and camera motion, 1 camera motion only, 2 zero
+  // While DLSS runs, a random sample index for the engine's dithered materials (RandomizeDither below).
+  bool random_dither = true;
   // Development: frame and shader dumps for offline analysis (DevDump below), read at load.
   bool dev_dumps = false;
 };
@@ -352,6 +358,7 @@ void LoadConfig() {
   if (g_config.render_scale != 0.0f) g_config.render_scale = std::clamp(g_config.render_scale, 0.33f, 1.0f);
   g_config.log_taa_passes = ReadInt(L"LogTaaPasses", 0) != 0;
   g_config.dev_dumps = ReadInt(L"DevDumps", 0) != 0;
+  g_config.random_dither = ReadInt(L"RandomDither", 1) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.motion_mode = std::clamp(ReadInt(L"MotionVectors", 0), 0, 2);
 }
@@ -368,6 +375,7 @@ void SaveConfig() {
   WriteInt(L"Mode", g_config.mode);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"MotionVectors", g_config.motion_mode);
+  WriteInt(L"RandomDither", g_config.random_dither);
 }
 
 void SetDlssEnabled(bool enabled) {
@@ -663,8 +671,86 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
   data->taa_like = g_diagnostics && g_compute_digests.count(p.handle) != 0;
 }
 
+// --- The engine's temporal dither, unlocked from the jitter -------------------------------------------------------
+
+// The game's dithered materials (a 4x4 pattern on skin that shifts every frame) take their frame-to-frame offset from
+// View.TemporalAAParams.x, the TAA sample index, which also picks the camera jitter: each jitter position always meets
+// the same dither state. The game's TAA blurs the states together; DLSS puts every frame's samples at their jitter
+// positions and keeps the dither as a fine grid (seen on Junpei's cheek; docs/recon.md). While DLSS runs, the first
+// time a frame binds the main view's View constants (its view size is DLSS's render size, its TemporalAAParams an
+// index below the sample count), the add-on writes a random index there, through the CPU mapping of the engine's upload
+// buffer, before any pass of the frame runs on the GPU: the dither then changes at random against the jitter, and DLSS
+// averages it like noise. The jitter itself (TemporalAAJitter) is left alone.
+constexpr uint32_t kMaxDitherChecks = 512;  // constant buffers looked at in a frame before giving up on it
+std::atomic<bool> g_dither_active{false};   // RandomDither on and DLSS ran in the last frames
+std::atomic<uint64_t> g_dither_frame{0};    // the last frame whose View constants got a random index
+std::atomic<uint64_t> g_dither_frames{0};   // frames so far
+std::atomic<float> g_dither_from{0.0f}, g_dither_to{0.0f}, g_dither_count{0.0f};
+std::mutex g_dither_mutex;
+uint64_t g_dither_checks_frame = 0;  // under g_dither_mutex
+uint32_t g_dither_checks = 0;
+
+uint64_t Mix64(uint64_t x) {  // splitmix64's finalizer
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ull;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+
+void RandomizeDither(device* dev, const buffer_range& range) {
+  const uint64_t frame = g_frame.load(std::memory_order_relaxed);
+  if (g_dither_frame.load(std::memory_order_relaxed) == frame || range.buffer == 0) return;
+  std::lock_guard lock(g_dither_mutex);
+  if (g_dither_frame.load() == frame) return;
+  if (g_dither_checks_frame != frame) {
+    g_dither_checks_frame = frame;
+    g_dither_checks = 0;
+  }
+  if (++g_dither_checks > kMaxDitherChecks) return;
+  const resource_desc desc = dev->get_resource_desc(range.buffer);
+  if (desc.type != resource_type::buffer || desc.heap != memory_heap::upload ||
+      range.offset + kTemporalAAParams + 16 > desc.buffer.size)
+    return;
+  constexpr uint32_t kSpan = kTemporalAAParams + 16 - kViewSizeAndInvSize;
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(range.buffer, range.offset + kViewSizeAndInvSize, kSpan, map_access::read_write,
+                              &mapped) ||
+      mapped == nullptr)
+    return;
+  auto* const base = static_cast<uint8_t*>(mapped);
+  float size[4], params[4];
+  std::memcpy(size, base, sizeof(size));
+  std::memcpy(params, base + (kTemporalAAParams - kViewSizeAndInvSize), sizeof(params));
+  const float width = static_cast<float>(g_render_width.load()), height = static_cast<float>(g_render_height.load());
+  if (size[0] == width && size[1] == height && std::fabs(size[0] * size[2] - 1.0f) < 1e-3f &&
+      std::fabs(size[1] * size[3] - 1.0f) < 1e-3f && params[1] >= 2.0f && params[1] <= 256.0f && params[0] >= 0.0f &&
+      params[0] < params[1] && params[0] == std::floor(params[0])) {
+    const float index = static_cast<float>(Mix64(frame) % static_cast<uint64_t>(params[1]));
+    std::memcpy(base + (kTemporalAAParams - kViewSizeAndInvSize), &index, sizeof(index));
+    g_dither_from = params[0];
+    g_dither_to = index;
+    g_dither_count = params[1];
+    g_dither_frame = frame;
+    if (++g_dither_frames == 1) {
+      char text[160];
+      std::snprintf(text, sizeof(text),
+                    "Dither: the engine's sample index for dithered materials is random from here on (frame %llu: "
+                    "%.0f of %.0f became %.0f).",
+                    static_cast<unsigned long long>(frame), params[0], params[1], index);
+      Log(reshade::log::level::info, text);
+    }
+  }
+  dev->unmap_buffer_region(range.buffer);
+}
+
 void OnPushDescriptors(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t param,
                        const descriptor_table_update& update) {
+  if (g_dither_active.load(std::memory_order_relaxed) && update.type == descriptor_type::constant_buffer &&
+      update.descriptors != nullptr) {
+    for (uint32_t i = 0; i < update.count; ++i)
+      RandomizeDither(cmd_list->get_device(), static_cast<const buffer_range*>(update.descriptors)[i]);
+  }
   if ((stages & shader_stage::compute) == 0 || update.type != descriptor_type::constant_buffer || update.count != 1 ||
       update.descriptors == nullptr)
     return;
@@ -759,6 +845,7 @@ bool ReadTaaConstants(device* dev, const p3rdlss::Descriptors& descriptors, cons
   std::memcpy(out->view_rect_min, at(kViewRectMin), sizeof(out->view_rect_min));
   std::memcpy(out->view_size, at(kViewSizeAndInvSize), sizeof(out->view_size));
   out->pre_exposure = *at(kPreExposure);
+  std::memcpy(out->taa_params, at(kTemporalAAParams), sizeof(out->taa_params));
   return true;
 }
 
@@ -1108,10 +1195,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     std::snprintf(json, sizeof(json),
                   "{\"frame\": %llu, \"dispatch\": %llu, \"render\": [%u, %u], \"input\": [%u, %u], \"output\": [%u, %u], "
                   "\"jitter\": [%.6f, %.6f], \"pre_exposure\": %.6g, \"phases\": %d, \"reset\": %d, \"mode\": %d, "
-                  "\"preset\": %d}",
+                  "\"preset\": %d, \"taa_params\": [%.0f, %.0f, %.4f, %.4f], \"dither_random\": %d}",
                   static_cast<unsigned long long>(frame), static_cast<unsigned long long>(dispatch), render_width,
                   render_height, in_width, in_height, width, height, jitter_x, jitter_y, c.pre_exposure,
-                  samples != nullptr ? samples[1] : -1, in.reset ? 1 : 0, g_config.mode, g_config.preset);
+                  samples != nullptr ? samples[1] : -1, in.reset ? 1 : 0, g_config.mode, g_config.preset,
+                  c.taa_params[0], c.taa_params[1], c.taa_params[2], c.taa_params[3],
+                  g_dither_frame.load() == frame ? 1 : 0);
     DevDumpFrame(cmd_list, color, render_width, render_height, output, width, height, json);
   }
   g_last_dlss_frame = frame;
@@ -1126,10 +1215,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     char text[320];
     std::snprintf(text, sizeof(text),
                   "DLSS frame %llu (TAA dispatch %llu): %ux%u to %ux%u, jitter %+.3f %+.3f px, %d jitter phases, "
-                  "corner jitter frames %llu, pre-exposure %.3g, camera cut %d, reset %d, failures %llu",
+                  "corner jitter frames %llu, dither index %.0f of %.0f (%s), pre-exposure %.3g, camera cut %d, "
+                  "reset %d, failures %llu",
                   static_cast<unsigned long long>(frames), static_cast<unsigned long long>(dispatch), render_width,
                   render_height, width, height, jitter_x, jitter_y, samples != nullptr ? samples[1] : -1,
-                  static_cast<unsigned long long>(g_corner_jitter_frames.load()), c.pre_exposure,
+                  static_cast<unsigned long long>(g_corner_jitter_frames.load()), c.taa_params[0], c.taa_params[1],
+                  g_dither_frame.load() == frame ? "random" : "the game's", c.pre_exposure,
                   c.camera_cut ? 1 : 0, in.reset ? 1 : 0, static_cast<unsigned long long>(g_failures.load()));
     Log(reshade::log::level::info, text);
   }
@@ -1522,6 +1613,8 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
     Log(reshade::log::level::info, g_config.enabled ? "DLSS on." : "DLSS off (game TAA).");
   }
   ApplyEngineVariables();
+  g_dither_active = g_config.random_dither && g_config.enabled && g_dlss_available &&
+                    g_last_dlss_frame.load() + 2 >= frame;
 
   if (g_recreate.load() && g_nvidia_ready) {
     queue->wait_idle();
@@ -1606,6 +1699,10 @@ void OnOverlay(effect_runtime*) {
                         "textures shimmer or show moire in motion, move it toward 0. The game's own TAA path uses 0.");
   if (ImGui::Checkbox("Game exposure", &g_config.game_exposure)) SaveConfig();
   ImGui::SetItemTooltip("Give DLSS the game's eye adaptation exposure. Off lets DLSS estimate one.");
+  if (ImGui::Checkbox("Random dither", &g_config.random_dither)) SaveConfig();
+  ImGui::SetItemTooltip("The game dithers some materials (a fine dot pattern on skin) and changes the pattern in step "
+                        "with the camera jitter, so DLSS keeps it as a grid. On: while DLSS runs, the dither gets a "
+                        "random step each frame and DLSS averages it out, as the game's TAA does. Off: the game's.");
 
   ImGui::Separator();
   if (ImGui::Checkbox("NVIDIA Reflex low latency", &g_config.reflex)) SaveConfig();
@@ -1640,6 +1737,13 @@ void OnOverlay(effect_runtime*) {
       } else {
         ImGui::Text("Camera jitter: %d phases (the game asks for %d)", samples[1], samples[0]);
       }
+    if (g_dither_frame.load() + 2 >= g_frame.load())
+      ImGui::Text("Dither: random (index %.0f instead of %.0f, of %.0f)", g_dither_to.load(), g_dither_from.load(),
+                  g_dither_count.load());
+    else if (g_dither_active.load())
+      ImGui::TextUnformatted("Dither: the game's (the view's constants were not found this frame)");
+    else
+      ImGui::TextUnformatted("Dither: the game's");
     } else
       ImGui::TextWrapped("Camera jitter: the game's (r.TemporalAASamples not found: %s)", g_jitter_detail.c_str());
     if (const int32_t* const upsampling = g_taa_upsampling.load())
