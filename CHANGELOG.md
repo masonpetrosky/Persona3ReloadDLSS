@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (not released yet)
 
 - Blue-noise SSAO (`SsaoBlueNoise`, on by default): the game's ambient occlusion rotates its samples by a 4x4 tile of
   noise that steps with the camera jitter, which DLSS kept as a fine lattice on skin and in corners. While DLSS runs,
